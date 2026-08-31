@@ -129,12 +129,12 @@ func loadManifest(path string) (*extManifest, error) {
 }
 
 // ListInstalledExtensions scans ~/.sliver-client/extensions and returns every
-// runnable command it finds — what the operator can `ext` in the GUI.
+// runnable command it finds - what the operator can `ext` in the GUI.
 func (a *App) ListInstalledExtensions() ([]ExtCommandView, error) {
 	dir := extensionsDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return []ExtCommandView{}, nil // no extensions installed yet — not an error
+		return []ExtCommandView{}, nil // no extensions installed yet - not an error
 	}
 	out := []ExtCommandView{}
 	for _, e := range entries {
@@ -353,7 +353,7 @@ func (a *App) RunExtension(sessionID, command string, args []string) (string, er
 		callName = depName
 		export = depEntry
 	} else {
-		// Regular DLL/.so extension — args are space-joined raw.
+		// Regular DLL/.so extension - args are space-joined raw.
 		callName = extName
 		export = c.Entrypoint
 		callArgs = []byte(strings.Join(args, " "))

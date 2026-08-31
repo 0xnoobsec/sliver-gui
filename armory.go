@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// ─── Armory — Extension Package Manager ──────────────────────────────────────
+// ─── Armory - Extension Package Manager ──────────────────────────────────────
 //
 // The Sliver "Armory" is a client-side package manager for extensions and
 // aliases. It fetches a JSON index from a GitHub-hosted repository listing
@@ -28,10 +28,10 @@ import (
 //   4. Extract to the correct local directory
 //
 // TODO: Add minisign signature verification for package integrity.
-//       Currently skipped — packages are fetched over HTTPS from GitHub.
+//       Currently skipped - packages are fetched over HTTPS from GitHub.
 
 const (
-	// Default armory index URL — the sliverarmory GitHub org's repos API
+	// Default armory index URL - the sliverarmory GitHub org's repos API
 	defaultArmoryIndexURL = "https://api.github.com/orgs/sliverarmory/repos?per_page=100"
 	// HTTP timeout for armory operations
 	armoryHTTPTimeout = 30 * time.Second
@@ -192,20 +192,87 @@ func (a *App) ArmoryInstall(packageName string) error {
 		return fmt.Errorf("asset download returned HTTP %d", dlResp.StatusCode)
 	}
 
-	// Step 4: Extract to the extensions directory
-	extDir := armoryExtDir()
-	installDir := filepath.Join(extDir, packageName)
-	if err := os.MkdirAll(installDir, 0755); err != nil {
-		return fmt.Errorf("create install dir: %w", err)
+	// Step 4: Extract to a staging dir first so we can inspect the manifest and
+	// pick the right install root (extensions vs aliases). The classification
+	// via package name is only a heuristic; the manifest file inside the tarball
+	// is authoritative.
+	stagingRoot, err := os.MkdirTemp("", "sliver-armory-*")
+	if err != nil {
+		return fmt.Errorf("create staging dir: %w", err)
 	}
+	defer os.RemoveAll(stagingRoot)
 
-	if err := extractTarGz(dlResp.Body, installDir); err != nil {
-		// Clean up on failure
-		os.RemoveAll(installDir)
+	if err := extractTarGz(dlResp.Body, stagingRoot); err != nil {
 		return fmt.Errorf("extract package: %w", err)
 	}
 
+	isAlias := hasFileWalking(stagingRoot, "alias.json")
+	var destRoot string
+	if isAlias {
+		destRoot = armoryAliasDir()
+	} else {
+		destRoot = armoryExtDir()
+	}
+	installDir := filepath.Join(destRoot, packageName)
+	if err := os.MkdirAll(destRoot, 0755); err != nil {
+		return fmt.Errorf("create install dir: %w", err)
+	}
+	// Replace any existing install atomically-ish (remove-then-rename).
+	_ = os.RemoveAll(installDir)
+	if err := os.Rename(stagingRoot, installDir); err != nil {
+		// Rename across filesystems can fail (e.g., TMPDIR on tmpfs, install on
+		// disk). Fall back to a copy walk.
+		if copyErr := copyTree(stagingRoot, installDir); copyErr != nil {
+			os.RemoveAll(installDir)
+			return fmt.Errorf("install package: %w", copyErr)
+		}
+	}
 	return nil
+}
+
+// hasFileWalking returns true if `name` exists anywhere under root.
+func hasFileWalking(root, name string) bool {
+	found := false
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() && info.Name() == name {
+			found = true
+			return io.EOF // stop
+		}
+		return nil
+	})
+	return found
+}
+
+// copyTree recursively copies src to dst.
+func copyTree(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rErr := filepath.Rel(src, path)
+		if rErr != nil {
+			return rErr
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		in, oErr := os.Open(path)
+		if oErr != nil {
+			return oErr
+		}
+		defer in.Close()
+		out, cErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode()&0755)
+		if cErr != nil {
+			return cErr
+		}
+		defer out.Close()
+		_, wErr := io.Copy(out, in)
+		return wErr
+	})
 }
 
 // ArmoryRemove uninstalls a package by deleting its directory.
@@ -304,8 +371,15 @@ func findMatchingAsset(assets []armoryGitHubAsset, goos, goarch string) string {
 	return ""
 }
 
-// extractTarGz extracts a .tar.gz stream into destDir with zip-slip protection.
+// extractTarGz extracts a .tar.gz stream into destDir with zip-slip protection,
+// a per-file size cap that ERRORS rather than silently truncating, a total-size
+// cap to bound an archive bomb, and safe file mode bits (never trust tarball
+// setuid/write bits from the network).
 func extractTarGz(r io.Reader, destDir string) error {
+	const perFileMax = int64(100 * 1024 * 1024)  // 100 MB per file
+	const totalMax = int64(1024 * 1024 * 1024)   // 1 GB total per archive
+	var totalWritten int64
+
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("gzip reader: %w", err)
@@ -322,7 +396,7 @@ func extractTarGz(r io.Reader, destDir string) error {
 			return fmt.Errorf("tar read: %w", err)
 		}
 
-		// Zip-slip protection: ensure the extracted path is within destDir
+		// Zip-slip protection: ensure the extracted path is within destDir.
 		target := filepath.Join(destDir, header.Name)
 		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(destDir)+string(os.PathSeparator)) {
 			return fmt.Errorf("zip-slip detected: %s", header.Name)
@@ -334,21 +408,42 @@ func extractTarGz(r io.Reader, destDir string) error {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
 		case tar.TypeReg:
-			// Ensure parent directory exists
+			if header.Size < 0 || header.Size > perFileMax {
+				return fmt.Errorf("file %s exceeds size limit (%d bytes, max %d)",
+					header.Name, header.Size, perFileMax)
+			}
+			if totalWritten+header.Size > totalMax {
+				return fmt.Errorf("archive exceeds total size limit of %d bytes", totalMax)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent %s: %w", target, err)
 			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			// Mask mode bits: strip setuid/setgid/sticky/group-write/other-write.
+			// Never trust the tarball to grant elevated permissions.
+			safeMode := os.FileMode(header.Mode) & 0o755
+			if safeMode == 0 {
+				safeMode = 0o644
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, safeMode)
 			if err != nil {
 				return fmt.Errorf("create %s: %w", target, err)
 			}
-			// Limit extraction size to 100MB per file to prevent resource exhaustion
-			limited := io.LimitReader(tr, 100*1024*1024)
-			if _, err := io.Copy(f, limited); err != nil {
-				f.Close()
-				return fmt.Errorf("write %s: %w", target, err)
-			}
+			// CopyN with exact header.Size guarantees we neither truncate nor
+			// over-read; if the tar stream lies (short read, EOF early), we get
+			// io.ErrUnexpectedEOF and abort.
+			n, cerr := io.CopyN(f, tr, header.Size)
 			f.Close()
+			if cerr != nil && cerr != io.EOF {
+				return fmt.Errorf("write %s: %w", target, cerr)
+			}
+			if n != header.Size {
+				return fmt.Errorf("write %s: short write (%d/%d)", target, n, header.Size)
+			}
+			totalWritten += n
+		case tar.TypeSymlink, tar.TypeLink:
+			// Symlinks and hardlinks in an untrusted archive can point outside
+			// the destination tree even after zip-slip check on Name. Refuse.
+			return fmt.Errorf("refusing to extract symlink/hardlink: %s", header.Name)
 		}
 	}
 	return nil

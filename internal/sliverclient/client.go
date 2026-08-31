@@ -51,12 +51,12 @@ func LoadConfig(path string) (*OperatorConfig, error) {
 
 // Connect dials the teamserver. Two important details vs a naive TLS setup:
 //
-//  1. InsecureSkipVerify: true  — the server's gRPC cert CN is something like
+//  1. InsecureSkipVerify: true  - the server's gRPC cert CN is something like
 //     "multiplayer" or the operator name, never "127.0.0.1". Hostname
 //     verification would fail silently and kill the handshake. We skip it but
 //     keep real CA verification via VerifyPeerCertificate.
 //
-//  2. Token interceptors — Sliver v1.6+ requires the operator token as an
+//  2. Token interceptors - Sliver v1.6+ requires the operator token as an
 //     Authorization header on every RPC call, not just mTLS.
 func Connect(cfg OperatorConfig) (*Client, error) {
 	certPEM := []byte(cfg.Certificate)
@@ -75,7 +75,7 @@ func Connect(cfg OperatorConfig) (*Client, error) {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{clientCert},
-		// Skip hostname check — server cert CN won't match the IP/host we dial.
+		// Skip hostname check - server cert CN won't match the IP/host we dial.
 		// We compensate with VerifyPeerCertificate below.
 		InsecureSkipVerify: true, //nolint:gosec
 		// Manually verify the server cert is signed by the teamserver CA.
@@ -177,6 +177,12 @@ func (c *Client) ListHTTPC2Profiles(ctx context.Context) ([]*clientpb.HTTPC2Conf
 	return resp.Configs, nil
 }
 
+// GetHTTPC2ProfileByName fetches a single HTTP C2 profile by name so callers
+// can inspect its URIs, headers, and user-agent without pulling every profile.
+func (c *Client) GetHTTPC2ProfileByName(ctx context.Context, name string) (*clientpb.HTTPC2Config, error) {
+	return c.RPC.GetHTTPC2ProfileByName(ctx, &clientpb.C2ProfileReq{Name: name})
+}
+
 func (c *Client) GenerateImplant(ctx context.Context, req *clientpb.GenerateReq) (*clientpb.Generate, error) {
 	longCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -187,6 +193,14 @@ func (c *Client) RenameSession(ctx context.Context, sessionID string, newName st
 	_, err := c.RPC.Rename(ctx, &clientpb.RenameReq{
 		SessionID: sessionID,
 		Name:      newName,
+	})
+	return err
+}
+
+func (c *Client) RenameBeacon(ctx context.Context, beaconID string, newName string) error {
+	_, err := c.RPC.Rename(ctx, &clientpb.RenameReq{
+		BeaconID: beaconID,
+		Name:     newName,
 	})
 	return err
 }

@@ -9,9 +9,10 @@
 <!-- Connect overlay -->
 <div id="connect-overlay" class="overlay">
   <div class="connect-card">
-    <div class="logo">SLIVER<span>GUI</span></div>
-    <p class="subtitle">Connect via operator config</p>
+    <div class="logo"><img src="./icons/C2.png" alt="Sliver" class="logo-mark"/><span class="logo-text">Console</span></div>
+    <p class="subtitle">Operator Console</p>
     <button id="pick-config-btn" class="btn primary full">[+] Select operator .cfg</button>
+    <input id="pick-config-input" type="file" accept=".cfg,application/json" style="display:none"/>
     <input id="manual-cfg-path" placeholder="or paste path: /path/to/file.cfg" style="width:100%;margin-top:6px"/>
     <div id="config-path" class="config-path"></div>
     <button id="connect-btn" class="btn accent full" disabled>Connect</button>
@@ -20,35 +21,107 @@
   </div>
 </div>
 
-<!-- Main shell (Cobalt Strike layout) -->
+<!-- Main shell -->
 <div id="app-shell" class="app-shell hidden">
 
-  <!-- Top toolbar -->
+  <!-- Top toolbar. Every dropdown item
+       carries data-view so the existing view dispatcher fires unchanged. -->
   <div class="toolbar-main">
-    <div class="toolbar-left">
-      <span class="brand-sm">SLIVER<span>GUI</span></span>
+    <div class="toolbar-left menu-bar" id="menu-bar">
+      <span class="brand-sm"><img src="./icons/C2.png" alt="Sliver" class="brand-sm-mark"/><span class="brand-sm-text">Client</span></span>
       <span class="sep">|</span>
-      <button class="tb-btn" data-view="sessions">Sessions</button>
-      <button class="tb-btn" data-view="beacons">Beacons</button>
-      <button class="tb-btn" data-view="listeners">Listeners</button>
-      <button class="tb-btn" data-view="generate">Generate</button>
-      <button class="tb-btn" data-view="builds">Builds</button>
-      <button class="tb-btn" data-view="profiles">Profiles</button>
-      <button class="tb-btn" data-view="events">Event Log</button>
-      <button class="tb-btn" data-view="loot">Loot</button>
-      <button class="tb-btn" data-view="creds">Creds</button>
-      <button class="tb-btn" data-view="hosts">Hosts</button>
-      <button class="tb-btn" data-view="operators">Operators</button>
-      <button class="tb-btn" data-view="scripts">Scripts</button>
-      <button class="tb-btn" data-view="iocs">IOCs</button>
-      <button class="tb-btn" data-view="report">Report</button>
-      <button class="tb-btn" data-view="c2profiles">C2 Profiles</button>
+
+      <div class="menu-group">
+        <button class="menu-trigger">Agents ▾</button>
+        <div class="menu-dropdown">
+          <button class="menu-item" data-view="sessions"><span class="mi-icon">💻</span>Sessions</button>
+          <button class="menu-item" data-view="beacons"><span class="mi-icon">📡</span>Beacons</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-view="health"><span class="mi-icon">📶</span>Chain Health</button>
+          <button class="menu-item" data-view="sleep"><span class="mi-icon">⏱</span>Beacon Sleep Dashboard</button>
+          <button class="menu-item" data-view="recordings"><span class="mi-icon">🎞</span>Session Recordings</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-view="operators"><span class="mi-icon">👥</span>Operators</button>
+        </div>
+      </div>
+
+      <div class="menu-group">
+        <button class="menu-trigger">Build ▾</button>
+        <div class="menu-dropdown">
+          <button class="menu-item" data-view="generate"><span class="mi-icon">🛠</span>Generate…</button>
+          <button class="menu-item" data-view="builds"><span class="mi-icon">📦</span>Builds</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-view="profiles"><span class="mi-icon">📋</span>Implant Profiles</button>
+          <button class="menu-item" data-view="c2profiles"><span class="mi-icon">📝</span>HTTP C2 Profiles</button>
+        </div>
+      </div>
+
+      <div class="menu-group">
+        <button class="menu-trigger">Attack ▾</button>
+        <div class="menu-dropdown">
+          <button class="menu-item" data-view="listeners"><span class="mi-icon">🎧</span>Listeners</button>
+          <button class="menu-item" data-view="websites"><span class="mi-icon">🌐</span>Websites - host + clone</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-view="scripts"><span class="mi-icon">⚡</span>Script Manager</button>
+          <button class="menu-item" data-view="watchdog"><span class="mi-icon">🐕</span>Watchdog rules</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-view="import"><span class="mi-icon">📥</span>Import (BH · CS · MSF)</button>
+        </div>
+      </div>
+
+      <div class="menu-group">
+        <button class="menu-trigger">Data ▾</button>
+        <div class="menu-dropdown">
+          <button class="menu-item" data-view="loot"><span class="mi-icon">💎</span>Loot</button>
+          <button class="menu-item" data-view="gallery"><span class="mi-icon">🖼</span>Screenshot Gallery</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-view="creds"><span class="mi-icon">🔑</span>Credentials</button>
+          <button class="menu-item" data-view="hosts"><span class="mi-icon">🖥</span>Hosts</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-view="events"><span class="mi-icon">📜</span>Event Log</button>
+          <button class="menu-item" data-view="iocs"><span class="mi-icon">🎯</span>IOC Tracker</button>
+        </div>
+      </div>
+
+      <div class="menu-group">
+        <button class="menu-trigger">Report ▾</button>
+        <div class="menu-dropdown">
+          <button class="menu-item" data-view="report"><span class="mi-icon">📄</span>Engagement Report</button>
+          <button class="menu-item" id="menu-mitre"><span class="mi-icon">🎯</span>MITRE ATT&amp;CK Coverage</button>
+        </div>
+      </div>
+
+      <div class="menu-group">
+        <button class="menu-trigger">Settings ▾</button>
+        <div class="menu-dropdown">
+          <button class="menu-item" data-view="settings"><span class="mi-icon">⚙</span>Settings…</button>
+          <button class="menu-item" id="menu-shortcuts"><span class="mi-icon">⌨</span>Keyboard shortcuts</button>
+          <button class="menu-item" id="menu-palette"><span class="mi-icon">🔍</span>Command palette  <span class="menu-kbd">Ctrl+K</span></button>
+        </div>
+      </div>
     </div>
     <div class="toolbar-right">
       <span id="server-version" class="version-tag"></span>
       <span id="operator-tag" class="operator-tag"></span>
+      <button id="help-btn" class="btn small" title="Keyboard shortcuts (?)">?</button>
       <button id="disconnect-btn" class="btn small">Disconnect</button>
     </div>
+  </div>
+
+  <!-- Statusline: live heartbeat + inventory + last event, always visible so
+       operators can pick up state at a glance without opening any panel. -->
+  <div class="statusline" id="statusline">
+    <span class="status-pill status-live" id="status-live" title="Event stream status">
+      <span class="status-dot"></span><span>live</span>
+    </span>
+    <span class="status-metric" id="status-listeners" title="Active listeners"><b>0</b> L</span>
+    <span class="status-metric" id="status-sessions" title="Active sessions"><b>0</b> S</span>
+    <span class="status-metric" id="status-beacons" title="Active beacons"><b>0</b> B</span>
+    <span class="status-metric" id="status-ops" title="Operators online"><b>0</b> ops</span>
+    <span class="status-sep"></span>
+    <span class="status-last" id="status-last" title="Most recent event"></span>
+    <span class="status-spacer"></span>
+    <span class="status-hint" title="Ctrl+K for command palette, ? for help">Ctrl+K · ?</span>
   </div>
 
   <!-- Split layout: top=graph/table, bottom=interaction -->
@@ -117,7 +190,7 @@
           <p style="margin-top:8px;color:var(--muted)">Available views: Sessions, Beacons, Listeners, Generate, Event Log, Loot, Operators</p>
         </div>
       </div>
-      <div class="panel-watermark" id="panel-watermark">Made by Raj Kumar Mullapudi</div>
+      <div class="panel-watermark" id="panel-watermark">Sliver GUI</div>
     </div>
 
   </div>
@@ -126,7 +199,7 @@
 <!-- Reconnect overlay -->
 <div id="reconnect-overlay" class="overlay hidden">
   <div class="connect-card">
-    <div class="logo">SLIVER<span>GUI</span></div>
+    <div class="logo"><img src="./icons/C2.png" alt="Sliver" class="logo-mark"/><span class="logo-text">Client</span></div>
     <p class="subtitle" style="color:var(--accent)">Connection to teamserver lost</p>
     <div id="reconnect-status" class="config-path">Reconnecting...</div>
     <div class="reconnect-count">Next attempt in <span id="reconnect-count">10</span>s</div>
@@ -149,22 +222,78 @@
 <!-- Command palette (Ctrl+K) -->
 <div id="palette-overlay" class="palette-overlay hidden">
   <div class="palette">
-    <input id="palette-input" class="palette-input" placeholder="Search agents & panels…  (↑↓ to move, Enter to open, Esc to close)" autocomplete="off"/>
+    <input id="palette-input" class="palette-input" placeholder="Search agents, panels, and actions…  (↑↓ move · Enter open · Esc close)" autocomplete="off"/>
     <div id="palette-results" class="palette-results"></div>
+  </div>
+</div>
+
+<!-- Keyboard shortcuts overlay (?). One place to see everything mapped, so a
+     new operator isn't hunting for the productivity features. -->
+<div id="kbd-overlay" class="palette-overlay hidden">
+  <div class="kbd-help">
+    <div class="kbd-head"><span>Keyboard shortcuts</span><button class="modal-close" id="kbd-close">×</button></div>
+    <div class="kbd-body">
+      <div class="kbd-group"><h4>Global</h4>
+        <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>K</kbd><span>Command palette · search agents, panels, and quick actions</span></div>
+        <div class="kbd-row"><kbd>?</kbd><span>This help</span></div>
+        <div class="kbd-row"><kbd>Esc</kbd><span>Close overlay / cancel dialog</span></div>
+      </div>
+      <div class="kbd-group"><h4>Agents (table &amp; graph)</h4>
+        <div class="kbd-row"><kbd>Double-click</kbd><span>Interact with an agent</span></div>
+        <div class="kbd-row"><kbd>Right-click</kbd><span>Context menu (Interact · Files · Procs · Kill …)</span></div>
+      </div>
+      <div class="kbd-group"><h4>Interactive shell</h4>
+        <div class="kbd-row"><kbd>↑</kbd> / <kbd>↓</kbd><span>Command history</span></div>
+        <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>C</kbd><span>Interrupt current PTY (in a shell tab)</span></div>
+      </div>
+      <div class="kbd-group"><h4>Palette-only quick actions</h4>
+        <div class="kbd-row"><span>Type:</span><span><code>test c2</code>, <code>change download dir</code>, <code>copy last c2 url</code>, <code>disconnect</code>, <code>help</code></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Auto-lock overlay (drawn on demand; blocks the whole UI). -->
+<div id="lock-overlay" class="lock-overlay hidden">
+  <div class="lock-card">
+    <div class="lock-icon">🔒</div>
+    <div style="font-weight:700;font-size:14px;margin-bottom:4px">Locked</div>
+    <div class="lock-msg">Session was idle. Enter your unlock passphrase to continue.</div>
+    <input id="lock-input" type="password" placeholder="passphrase" autocomplete="off"/>
+    <div style="display:flex;gap:8px;margin-top:12px;justify-content:center">
+      <button class="btn small" id="lock-cancel">Disconnect</button>
+      <button class="btn small accent" id="lock-unlock">Unlock</button>
+    </div>
+    <div id="lock-error" style="color:var(--accent);font-size:11px;margin-top:8px;min-height:12px"></div>
   </div>
 </div>
 
 <!-- Context menu -->
 <div id="ctx-menu" class="ctx-menu hidden">
-  <div class="ctx-item" id="ctx-interact">Interact</div>
-  <div class="ctx-item" id="ctx-files">File Browser</div>
-  <div class="ctx-item" id="ctx-processes">Process Browser</div>
-  <div class="ctx-item" id="ctx-integrity">Check Integrity</div>
-  <div class="ctx-item" id="ctx-rename">Rename</div>
-  <div class="ctx-divider"></div>
-  <div class="ctx-item danger" id="ctx-kill">Kill</div>
+  <!-- data-for filters visibility: both | session | beacon. showCtx() enforces
+       it every time the menu opens. Every entry launches a FEATURE panel -
+       nothing here fires a single command against the agent. -->
+  <div class="ctx-item" id="ctx-interact"     data-for="both">▶ Interact - open console</div>
+  <div class="ctx-divider" data-for="both"></div>
+  <div class="ctx-item" id="ctx-files"        data-for="session">📁 File Browser</div>
+  <div class="ctx-item" id="ctx-processes"    data-for="session">⚙ Process Browser</div>
+  <div class="ctx-divider" data-for="beacon"></div>
+  <div class="ctx-item" id="ctx-tasks"        data-for="beacon">🗒 Task queue - view / cancel</div>
+  <div class="ctx-item" id="ctx-sleep"        data-for="beacon">⏱ Beacon sleep dashboard</div>
+  <div class="ctx-divider" data-for="both"></div>
+  <div class="ctx-item" id="ctx-rename"       data-for="both">✎ Rename</div>
+  <div class="ctx-item" id="ctx-tag"          data-for="both">🏷 Tag / label</div>
+  <div class="ctx-item" id="ctx-handoff"      data-for="both">📝 Handoff comment</div>
+  <div class="ctx-divider" data-for="both"></div>
+  <div class="ctx-item" id="ctx-copyip"       data-for="both">📋 Copy remote IP</div>
+  <div class="ctx-item" id="ctx-copyid"       data-for="both">📋 Copy agent ID</div>
+  <div class="ctx-divider" data-for="both"></div>
+  <div class="ctx-item danger" id="ctx-kill"  data-for="both">✕ Kill / Remove</div>
 </div>
 
 <script src="./main.js"></script>
+<script src="./features-bundle.js"></script>
+<script src="./features-extra.js"></script>
+<script src="./features-websites.js"></script>
 </body>
 </html>

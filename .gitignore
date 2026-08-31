@@ -1,6 +1,7 @@
 # ── Build output ─────────────────────────────────────────────
 build/bin/
 build/*.o
+build/tmp/
 # Release-staging dir used by the release workflow / `make`.
 dist/
 *.exe
@@ -13,7 +14,7 @@ frontend/wailsjs/
 frontend/dist/wailsjs/
 node_modules/
 
-# ── Operator credentials — NEVER commit these ────────────────
+# ── Operator credentials - NEVER commit these ────────────────
 # Sliver operator config files contain live mTLS keys + auth tokens.
 *.cfg
 *.pem

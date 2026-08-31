@@ -98,6 +98,68 @@ func TestParseExecuteResponse(t *testing.T) {
 	}
 }
 
+func TestBuildImplantConfigRespectsOperatorProfile(t *testing.T) {
+	// When the operator picks an HTTP C2 profile, that name must land in
+	// cfg.HTTPC2ConfigName verbatim - otherwise the beacon uses the wrong
+	// URIs/headers/UA and a redirector gated on a shared-secret header will
+	// silently 401 every check-in.
+	a := &App{}
+	req := GenerateRequest{
+		GOOS:          "windows",
+		GOARCH:        "amd64",
+		Format:        "exe",
+		C2URL:         "https://cdn.example.net",
+		HTTPC2Profile: "  my-header-profile  ", // whitespace-tolerant
+	}
+	cfg := a.buildImplantConfig(req)
+	if cfg.HTTPC2ConfigName != "my-header-profile" {
+		t.Errorf("HTTPC2ConfigName = %q, want %q", cfg.HTTPC2ConfigName, "my-header-profile")
+	}
+	if !cfg.IncludeHTTP {
+		t.Errorf("IncludeHTTP not set for https scheme")
+	}
+}
+
+func TestBuildImplantConfigFallsBackToDefault(t *testing.T) {
+	// With no operator profile and no live client, the fallback must land on
+	// "default" so the teamserver picks whatever it has. Guards against a nil-
+	// deref regression if the fallback ever forgets to handle a nil client.
+	a := &App{}
+	req := GenerateRequest{
+		GOOS:   "windows",
+		GOARCH: "amd64",
+		Format: "exe",
+		C2URL:  "https://cdn.example.net",
+	}
+	cfg := a.buildImplantConfig(req)
+	if cfg.HTTPC2ConfigName != "default" {
+		t.Errorf("HTTPC2ConfigName = %q, want default", cfg.HTTPC2ConfigName)
+	}
+}
+
+func TestTestC2URLRejectsBadInputs(t *testing.T) {
+	// Empty/invalid URLs and non-HTTP schemes must return an actionable
+	// message instead of silently hanging or panicking. We deliberately don't
+	// exercise inputs like "host:8443" here - url.Parse is permissive enough
+	// that the observed scheme depends on Go version, so the response is a
+	// diagnostic Note rather than a hard Error, and we don't want to lock in
+	// which branch fires for those edge cases.
+	a := &App{}
+	if r := a.TestC2URL("", nil); r.Error == "" {
+		t.Error("empty URL should error")
+	}
+	if r := a.TestC2URL("http://%zz", nil); r.Error == "" {
+		// %zz is an invalid percent-escape - url.Parse rejects it outright.
+		t.Error("URL with invalid percent-escape should error")
+	}
+	if r := a.TestC2URL("mtls://host:8443", nil); r.Note == "" || r.Error != "" {
+		t.Errorf("mtls scheme should return Note, got err=%q note=%q", r.Error, r.Note)
+	}
+	if r := a.TestC2URL("dns://example.com", nil); r.Note == "" || r.Error != "" {
+		t.Errorf("dns scheme should return Note, got err=%q note=%q", r.Error, r.Note)
+	}
+}
+
 func TestDecodeDownload(t *testing.T) {
 	// Plain (no encoder) passes through.
 	if got, err := decodeDownload(&sliverpb.Download{Data: []byte("raw")}); err != nil || string(got) != "raw" {

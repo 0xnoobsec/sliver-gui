@@ -224,7 +224,7 @@ func (a *App) RegistryReadHiveExport(sessionID, rootHive, requestedHive string) 
 	return savePath, nil
 }
 
-// ─── Services (Windows) — native RPC detail/start ───────────────────────────
+// ─── Services (Windows) - native RPC detail/start ───────────────────────────
 // (ServiceView, serviceView, and ListServices live in app.go.)
 
 // ServiceDetail returns full detail for a single named service.
@@ -404,6 +404,35 @@ func (a *App) ListTrafficEncoders() ([]string, error) {
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// AddTrafficEncoder uploads a WASM encoder blob and registers it on the
+// teamserver. `filename` becomes the encoder key returned by
+// ListTrafficEncoders; `wasm` is the raw .wasm bytes. SkipTests is exposed
+// because tests can take a long time and are optional per Sliver's schema.
+func (a *App) AddTrafficEncoder(filename string, wasm []byte, skipTests bool) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.TrafficEncoderAdd(a.ctx, &clientpb.TrafficEncoder{
+		Wasm:      &commonpb.File{Name: filename, Data: wasm},
+		SkipTests: skipTests,
+	})
+	return err
+}
+
+// RemoveTrafficEncoder removes an installed traffic encoder by its filename
+// (the map key returned by ListTrafficEncoders).
+func (a *App) RemoveTrafficEncoder(filename string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.TrafficEncoderRm(a.ctx, &clientpb.TrafficEncoder{
+		Wasm: &commonpb.File{Name: filename},
+	})
+	return err
 }
 
 // ListShellcodeEncoders returns the names of available shellcode encoders.

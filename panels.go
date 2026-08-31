@@ -211,7 +211,7 @@ type ParsedCredential struct {
 }
 
 // ParseAndStoreCredentials parses script output for well-known credential formats.
-// It does NOT auto-store into Sliver's cred DB — call ConfirmAndStoreCredentials
+// It does NOT auto-store into Sliver's cred DB - call ConfirmAndStoreCredentials
 // with the returned slice after the operator reviews them.
 func (a *App) ParseAndStoreCredentials(output, source string) []ParsedCredential {
 	creds := parseCredentials(output)
@@ -249,7 +249,7 @@ func (a *App) ConfirmAndStoreCredentials(creds []ParsedCredential) error {
 	return nil
 }
 
-// Compiled credential regexes — only match well-known output formats.
+// Compiled credential regexes - only match well-known output formats.
 var (
 	// SAM dump: user:RID:LM_hash:NTLM_hash:::
 	reSAMHash = regexp.MustCompile(`(?m)^([\w$\.\-]+):\d+:[a-fA-F0-9]{32}:([a-fA-F0-9]{32})`)
@@ -409,7 +409,7 @@ func (a *App) GetEngagementElapsed() int64 {
 	return int64(time.Since(*engagementStart).Seconds())
 }
 
-// ─── Builder Streaming (placeholder — streams are complex in Wails) ───────────
+// ─── Builder Streaming (placeholder - streams are complex in Wails) ───────────
 
 // GetBuilders lists external builders connected to the teamserver.
 func (a *App) GetBuilders() ([]map[string]interface{}, error) {
