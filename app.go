@@ -4298,7 +4298,7 @@ func formatNativeResponse(data []byte, cmdType string) string {
 				if len(owner) > 20 {
 					owner = owner[:20]
 				}
-				out.WriteString(fmt.Sprintf("%-8d%-8d%-21s%s\n", p.Pid, p.Ppid, owner, p.Executable))
+				fmt.Fprintf(&out, "%-8d%-8d%-21s%s\n", p.Pid, p.Ppid, owner, p.Executable)
 			}
 			return out.String()
 		}
@@ -4333,7 +4333,7 @@ func formatNativeResponse(data []byte, cmdType string) string {
 				if !f.IsDir {
 					size = fmt.Sprintf("%d", f.Size)
 				}
-				out.WriteString(fmt.Sprintf("%s %-11s %9s  %s\n", dir, f.Mode, size, f.Name))
+				fmt.Fprintf(&out, "%s %-11s %9s  %s\n", dir, f.Mode, size, f.Name)
 			}
 			return out.String()
 		}
@@ -4360,8 +4360,8 @@ func formatNativeResponse(data []byte, cmdType string) string {
 					pid = e.Process.Pid
 					proc = e.Process.Executable
 				}
-				out.WriteString(fmt.Sprintf("%-7s%-22s%-22s%-13s%-7d%s\n",
-					e.Protocol, local, remote, e.SkState, pid, proc))
+				fmt.Fprintf(&out, "%-7s%-22s%-22s%-13s%-7d%s\n",
+					e.Protocol, local, remote, e.SkState, pid, proc)
 			}
 			return out.String()
 		}
@@ -4374,7 +4374,7 @@ func formatNativeResponse(data []byte, cmdType string) string {
 			}
 			var out strings.Builder
 			for _, v := range resp.Variables {
-				out.WriteString(fmt.Sprintf("%s=%s\n", v.Key, v.Value))
+				fmt.Fprintf(&out, "%s=%s\n", v.Key, v.Value)
 			}
 			return out.String()
 		}
@@ -4387,8 +4387,8 @@ func formatNativeResponse(data []byte, cmdType string) string {
 			}
 			var out strings.Builder
 			for _, ni := range resp.NetInterfaces {
-				out.WriteString(fmt.Sprintf("%s  MAC=%s  IPs=%s\n",
-					ni.Name, ni.MAC, strings.Join(ni.IPAddresses, ", ")))
+				fmt.Fprintf(&out, "%s  MAC=%s  IPs=%s\n",
+					ni.Name, ni.MAC, strings.Join(ni.IPAddresses, ", "))
 			}
 			return out.String()
 		}

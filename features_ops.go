@@ -803,7 +803,8 @@ func (a *App) ImportBloodHoundJSON(payload string) BHImportResult {
 	// forms are supported.
 	trimmed := strings.TrimSpace(payload)
 	var raw []map[string]interface{}
-	if trimmed[0] == '{' {
+	switch trimmed[0] {
+	case '{':
 		var env struct {
 			Data []map[string]interface{} `json:"data"`
 			Meta map[string]interface{}   `json:"meta"`
@@ -813,12 +814,12 @@ func (a *App) ImportBloodHoundJSON(payload string) BHImportResult {
 			return res
 		}
 		raw = env.Data
-	} else if trimmed[0] == '[' {
+	case '[':
 		if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
 			res.Error = "parse array: " + err.Error()
 			return res
 		}
-	} else {
+	default:
 		res.Error = "not JSON (must start with { or [)"
 		return res
 	}
@@ -960,7 +961,7 @@ func (a *App) ImportCobaltStrikeReport(text string) CSImportResult {
 		if i := strings.Index(ln, ":"); i > 0 && !strings.ContainsAny(ln, " \t") && len(ln) < 300 {
 			user := ln[:i]
 			secret := ln[i+1:]
-			if user != "" && secret != "" && strings.IndexAny(user, "\\@") >= 0 {
+			if user != "" && secret != "" && strings.ContainsAny(user, "\\@") {
 				if err := a.AddCred(user, secret, ""); err == nil {
 					res.Creds++
 					continue
