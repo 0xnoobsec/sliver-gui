@@ -45,8 +45,9 @@ One-click post-exploitation **recipes** with **dry-run preview**, **MITRE ATT&CK
 - **Enumeration** - network scan, Active Directory enumeration, local Windows enum.
 
 ### Operator Panels
-- **File Browser** - visual remote filesystem with breadcrumb navigation.
+- **File Browser** - editable address bar, upload / download, rename / copy / delete, chmod, grep, and hidden-file toggle.
 - **Process Browser** - visual process list with search, kill, and migrate.
+- **Website Cloner** - mirror a public page and host it under a Sliver site, with CSP / SRI / `<base>` stripped and optional payload injection.
 - **Kill-Chain Tracker** - record and visualise engagement stages.
 - **IOC Tracker** - log indicators as you drop them, generate cleanup scripts.
 - **Chain Health** - probe all listeners with sparkline history.
@@ -97,7 +98,8 @@ make build            # → build/bin/sliver-gui   (or: wails build -tags webkit
 <br>
 
 **Per-agent:** `ps · ls · cd · pwd · cat · mkdir · rm · mv · cp · chmod · chown · download · upload ·
-screenshot · netstat · ifconfig · env · getenv · setenv · unsetenv · reg · grep · mount · memfiles ·
+screenshot · netstat · ifconfig · env · getenv · setenv · unsetenv · reg [read/write/listvals/listkeys/createkey/deletekey/delete] ·
+svc [list/info/start/stop/create/remove] · grep · mount · memfiles ·
 ssh · whoami · getprivs · getpid · procdump · kill · chtimes · execute · execute-assembly ·
 execute-shellcode · sideload · spawndll · getsystem · make-token · impersonate · rev2self · runas ·
 migrate · backdoor · dllhijack · msf · msf-inject · extensions · ext · socks · portfwd · rportfwd ·
