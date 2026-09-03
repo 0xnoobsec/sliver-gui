@@ -4182,7 +4182,7 @@ document.getElementById('reconnect-cancel-btn').addEventListener('click', async 
   try { bi = await App().AppVersion(); } catch (e) { /* runtime not ready or older backend */ }
   const el = document.getElementById('gui-version');
   if (el) {
-    el.textContent = bi && bi.version ? `${bi.version} · ${bi.gitCommit}` : '';
+    el.textContent = bi && bi.version ? bi.version : '';
     el.title = bi ? `Built ${bi.buildDate}` : '';
   }
   const wm = document.getElementById('panel-watermark');
